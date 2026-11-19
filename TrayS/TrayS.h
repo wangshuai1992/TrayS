@@ -337,6 +337,10 @@ PROCESSCPUUSAGE *ppcu[6];
 int nProcess;
 PROCESSTIME * pProcessTime;
 int nProcessTimeCap = 0;//pProcessTime 实际分配的条数，遍历不能超过它
+BYTE* pSpiBuf = NULL;//进程快照缓冲区（NtQuerySystemInformation），悬停窗口关掉后释放
+ULONG nSpiCap = 0;
+ULONGLONG tProcCpu = 0;//上次算进程 CPU 的时间，0 表示还没有基准
+BOOL bProcCpuReady = FALSE;//进程 CPU 占用已经有两次采样（悬停窗口刚打开时还没有）
 CRITICAL_SECTION csProcess;//界面线程（悬停）和数据线程都会分配、刷新、释放 pProcessTime，用它串行化
 
 //BOOL bTaskOther = FALSE;

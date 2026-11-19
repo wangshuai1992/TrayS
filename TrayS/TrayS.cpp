@@ -553,6 +553,8 @@ void OpenTaskBar()
 			if (TraySave.bMonitorTransparent&&TraySave.bMonitorFloat)
 				SetWindowLongPtr(hTaskBar, GWL_EXSTYLE, GetWindowLongPtr(hTaskBar, GWL_EXSTYLE) |WS_EX_LAYERED |WS_EX_TRANSPARENT);
 			SetTimer(hTaskBar, 3, 1000, NULL);
+			if (rovi.dwBuildNumber >= 22000)
+				SetTimer(hTaskBar, 8, 100, NULL);//Win11 悬停轮询
 			//			SetTimer(hTaskBar, 6, 100, NULL);
 		}
 	}
@@ -680,6 +682,9 @@ BOOL IsNvGpuSleeping()
 		return FALSE;
 	return pd[1] >= 4;//CM_POWER_DATA.PD_MostRecentPowerState >= PowerDeviceD3
 }
+#include "NetTop.h"//进程网速排行（ETW）
+#include "Fluent.h"
+#include "FluentSet.h"//方案 A 设置窗口//方案 A 界面（用到上面定义的全局变量）
 //////////////////////////////////////////////////载入温度DLL
 void LoadTemperatureDLL()
 {
@@ -814,6 +819,8 @@ void OpenSetting()
 {
 	if (IsWindow(hSetting))
 	{
+		if (IsIconic(hSetting))//最小化了要先还原，SetForegroundWindow 不会还原
+			ShowWindow(hSetting, SW_RESTORE);
 		SetForegroundWindow(hSetting);
 		return;
 	}
@@ -927,6 +934,7 @@ void OpenSetting()
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_LOW), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_MEDUIM), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_HIGH), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
+	FSetInit(hSetting);//换成方案 A 的布局和样式
 	ShowWindow(hSetting, SW_SHOW);
 	UpdateWindow(hSetting);
 	SetForegroundWindow(hSetting);
@@ -1241,7 +1249,8 @@ DWORD dwIPSize = 0;
 DWORD dwMISize = 0;
 int iGetAddressTime = 10;//10秒一次获取网卡信息
 DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
-{	
+{
+	NetTopCleanup();
 	while (!bRealClose)
 	{
 		DWORD dStart = GetTickCount();
@@ -1254,7 +1263,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 				if (TraySave.bMonitorUsage == FALSE)
 					GetPDH(FALSE, TRUE);
 			}
-			if (TraySave.bMonitorUsage)
+			if (TraySave.bMonitorUsage || IsWindow(hTaskTips))//悬停窗口里也要显示 CPU
 			{
 				iCPU = GetCPUUseRate();
 			}
@@ -1263,12 +1272,21 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			{
 				nProcess = GetProcessMemUsage();
 				GetProcessCpuUsage();
+				NetTopTick();
 			}
 			else if (pProcessTime != NULL)
 			{
 				nProcessTimeCap = 0;
 				HeapFree(GetProcessHeap(), 0, pProcessTime);
 				pProcessTime = NULL;
+				tProcCpu = 0;
+				bProcCpuReady = FALSE;
+				if (pSpiBuf)
+				{
+					HeapFree(GetProcessHeap(), 0, pSpiBuf);
+					pSpiBuf = NULL;
+					nSpiCap = 0;
+				}
 			}
 			LeaveCriticalSection(&csProcess);
 			if (TraySave.bMonitorTemperature)
@@ -1512,8 +1530,9 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			*/
 			if (TraySave.bMonitor)
 			{
+				FHistPush((float)iCPU, (float)TrayData->s_in_byte, (float)TrayData->s_out_byte);//悬停窗口的曲线
 				if (IsWindowVisible(hTaskTips))
-					::InvalidateRect(hTaskTips, NULL, TRUE);
+					PostMessage(hTaskTips, WM_FLY_DATA, 0, 0);
 				DWORD dm = GetSystemUsesLightTheme();
 				if (dm != bThemeMode)
 				{
@@ -1988,6 +2007,7 @@ void SetWH()
 //	mHeight += 4;
 	SelectObject(mdc, oldFont);
 	ReleaseDC(hMain, mdc);
+	FBarSetWH();//新样式按 DirectWrite 重新量宽度
 	ottop = -1;
 	otleft = -1;
 }
@@ -2343,508 +2363,98 @@ void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit, int iUnit)
 	if (bBit)
 		lstrlwr(sz, lstrlen(sz));
 }
-INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)//提示信息窗口过程
+INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)//悬停窗口过程（绘制和交互在 Fluent.h）
 {
-	switch (message)
-	{
-	case WM_INITDIALOG:
+	if (message == WM_INITDIALOG)
 		return (INT_PTR)TRUE;
-	case WM_MOUSEMOVE:
+	return FlyProc(hDlg, message, wParam, lParam);
+}
+//SYSTEM_PROCESS_INFORMATION 的前半部分（winternl.h 把这些字段藏在 Reserved 里）
+typedef struct _FSPI
+{
+	ULONG NextEntryOffset;
+	ULONG NumberOfThreads;
+	LARGE_INTEGER WorkingSetPrivateSize;
+	ULONG HardFaultCount;
+	ULONG NumberOfThreadsHighWatermark;
+	ULONGLONG CycleTime;
+	LARGE_INTEGER CreateTime;
+	LARGE_INTEGER UserTime;
+	LARGE_INTEGER KernelTime;
+	struct { USHORT Length, MaximumLength; PWSTR Buffer; } ImageName;
+	LONG BasePriority;
+	HANDLE UniqueProcessId;
+	HANDLE InheritedFromUniqueProcessId;
+	ULONG HandleCount;
+	ULONG SessionId;
+	ULONG_PTR UniqueProcessKey;
+	SIZE_T PeakVirtualSize;
+	SIZE_T VirtualSize;
+	ULONG PageFaultCount;
+	SIZE_T PeakWorkingSetSize;
+	SIZE_T WorkingSetSize;
+}FSPI;
+typedef LONG(WINAPI* pfnNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+pfnNtQuerySystemInformation pNtQuerySystemInformation = NULL;
+//一次系统调用取所有进程的名字、内存、CPU 时间。原来每个进程都要 OpenProcess，两个函数加起来 300 个进程约 20ms
+ULONGLONG tSpi = 0;
+FSPI* ProcSnapshot()
+{
+	if (pSpiBuf && GetTickCount64() - tSpi < 100)//内存和 CPU 两个函数总是连着调用，共用一次快照
+		return (FSPI*)pSpiBuf;
+	if (!pNtQuerySystemInformation)
+		pNtQuerySystemInformation = (pfnNtQuerySystemInformation)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtQuerySystemInformation");
+	if (!pNtQuerySystemInformation)
+		return NULL;
+	for (int k = 0; k < 4; k++)
 	{
-		POINT pt;
-		pt.x = GET_X_LPARAM(lParam);
-		pt.y = GET_Y_LPARAM(lParam);
-		RECT rc;
-		GetClientRect(hDlg, &rc);
-		rc.top = nTraffic * wTipsHeight;
-		rc.bottom = (nTraffic + 12) * wTipsHeight;
-		rc.left = rc.right * 100 / 178;
-		rc.right = rc.right * 100 / 145;
-		if (PtInRect(&rc, pt))
+		ULONG need = 0;
+		LONG st = pSpiBuf ? pNtQuerySystemInformation(5, pSpiBuf, nSpiCap, &need) : (LONG)0xC0000004;//5: SystemProcessInformation
+		if (st == 0)
 		{
-			inTipsProcessX = TRUE;
-			::InvalidateRect(hDlg, NULL, TRUE);
+			tSpi = GetTickCount64();
+			return (FSPI*)pSpiBuf;
 		}
-		else
+		if (st != (LONG)0xC0000004)//STATUS_INFO_LENGTH_MISMATCH
+			return NULL;
+		if (pSpiBuf)
+			HeapFree(GetProcessHeap(), 0, pSpiBuf);
+		nSpiCap = (need > 262144 ? need : 262144) + 65536;//进程线程变多时留余量
+		pSpiBuf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, nSpiCap);
+		if (!pSpiBuf)
 		{
-			inTipsProcessX = FALSE;
+			nSpiCap = 0;
+			return NULL;
 		}
 	}
-	break;
-	case WM_LBUTTONDOWN:
-	{
-		POINT pt;
-		pt.x = GET_X_LPARAM(lParam);
-		pt.y = GET_Y_LPARAM(lParam);
-		if (pt.y == 0)
-			pt.y = 1;
-		if (pt.y < nTraffic * wTipsHeight)
-			RunProcess(NULL, szNetCpl);
-		else if (pt.y < (nTraffic + 12) * wTipsHeight)
+	return NULL;
+}
+void ProcName(FSPI* sp, WCHAR* sz)//进程名，最多 35 个字符（和原来 lstrcpyn(…, 36) 一样）
+{
+	int len = sp->ImageName.Buffer ? sp->ImageName.Length / 2 : 0;
+	if (len > 35)
+		len = 35;
+	if (len)
+		lstrcpyn(sz, sp->ImageName.Buffer, len + 1);
+	else
+		lstrcpy(sz, L"System");
+}
+BOOL ProcNameByPid(DWORD pid, WCHAR* sz)//网速排行用，调用方已在 csProcess 里
+{
+	for (FSPI* sp = ProcSnapshot(); sp; sp = sp->NextEntryOffset ? (FSPI*)((BYTE*)sp + sp->NextEntryOffset) : NULL)
+		if ((DWORD)(ULONG_PTR)sp->UniqueProcessId == pid)
 		{
-			RECT rc;
-			GetClientRect(hDlg, &rc);
-			rc.left = rc.right * 100 / 178;
-			rc.right = rc.right * 100 / 145;
-			if (PtInRect(&rc, pt))
-			{				
-				int x = 0;
-				if (wTipsHeight != 0)
-					x = (pt.y / wTipsHeight) - nTraffic;
-				DWORD pid;
-				if (x < 6)
-					pid = ppcu[x]->dwProcessID;
-				else
-					pid = ppmu[x - 6]->dwProcessID;
-				rc.left = rc.right * 145 / 156;
-				if (PtInRect(&rc, pt))
-				{
-					HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-					if (hProc)
-					{
-						TerminateProcess(hProc, 0);
-						CloseHandle(hProc);
-					}
-				}
-				else
-				{
-					OpenProcessPath(pid);
-				}
-				inTipsProcessX = FALSE;
-				GetCursorPos(&pt);
-				SetCursorPos(pt.x + 88, pt.y);
-			}
-			else
-			{
-				if((pt.y / wTipsHeight) - nTraffic<6)
-					RunProcess(NULL, szTaskmgr);
-				else
-					RunProcess(NULL, szPerfmon);
-			}
+			ProcName(sp, sz);
+			return TRUE;
 		}
-		else
-		{
-			RECT rc;
-			GetClientRect(hDlg, &rc);
-			if (pt.x < rc.right * 8 / 100)
-			{
-				bSetting = TRUE;
-				SendMessage(hMain, WM_TRAYS, 0, 0);				
-			}
-			else if (pt.x > rc.right * 92 / 100)
-			{
-				bRealClose = TRUE;
-				TrayData->bExit = TRUE;
-				SendMessage(hMain, WM_CLOSE, 0, 0);
-			}
-			else
-			{
-				if (pt.y < (nTraffic + 13) * wTipsHeight)
-				{
-					WCHAR wDrive[MAX_PATH];
-					DWORD dwLen = GetLogicalDriveStrings(MAX_PATH, wDrive);
-					if (dwLen != 0)
-					{
-						DWORD driver_number = dwLen / 4;
-						DWORD x = pt.x / ((rc.right - rc.right * 8 / 100) / driver_number);
-						if (x < driver_number)
-						{
-							WCHAR sz[24];
-							memset(sz, 0, 48);
-							wsprintf(sz, L"o%s", &wDrive[x * 4]);
-							RunProcess(NULL, sz);
-						}
-					}
-				}
-				else
-				{
-					if(pt.x<rc.right/2)
-						RunProcess(NULL, szCompmgmt);
-					else
-						RunProcess(NULL, szPowerCpl);
-				}
-			}
-		}
-		return TRUE;
-	}
-	break;
-	case WM_ERASEBKGND:
-		HDC hdc = (HDC)wParam;//BeginPaint(hDlg, &ps);
-		RECT rc, crc;
-		GetClientRect(hDlg, &rc);
-		crc = rc;
-		HDC mdc = CreateCompatibleDC(hdc);
-		if (mdc)
-		{
-			HBITMAP hMemBmp = CreateCompatibleBitmap(hdc, rc.right - rc.left, rc.bottom - rc.top);
-			HBITMAP oldBmp = (HBITMAP)SelectObject(mdc, hMemBmp);
-			//		if (bErasebkgnd)
-			{
-				TraySave.TipsFont.lfHeight = DPI(TraySave.TipsFontSize);
-				HFONT hTipsFont = CreateFontIndirect(&TraySave.TipsFont); //创建字体
-				HFONT oldFont = (HFONT)SelectObject(mdc, hTipsFont);
-				WCHAR sz[64];
-				SetBkMode(mdc, TRANSPARENT);
-				COLORREF rgb;
-				rgb = RGB(192, 192, 192);
-				SetTextColor(mdc, rgb);
-				rc.bottom = wTipsHeight;
-				HBRUSH hb = CreateSolidBrush(RGB(24, 24, 24));
-				for (int i = 0; i < nTraffic / 2 + 8; i++)
-				{
-					FillRect(mdc, &rc, hb);
-					OffsetRect(&rc, 0, wTipsHeight * 2);
-				}
-				DeleteObject(hb);
-				HPEN hp = CreatePen(PS_DOT, 1, RGB(98, 98, 98));
-				HPEN oldpen = (HPEN)SelectObject(mdc, hp);
-				MoveToEx(mdc, crc.right * 10 / 31, 0, NULL);
-				LineTo(mdc, crc.right * 10 / 31, wTipsHeight * nTraffic);
-
-				MoveToEx(mdc, crc.right * 57 / 100, 0, NULL);
-				LineTo(mdc, crc.right * 57 / 100, wTipsHeight* nTraffic);
-				MoveToEx(mdc, crc.right * 66 / 100, 0, NULL);
-				LineTo(mdc, crc.right * 66 / 100, wTipsHeight* nTraffic);
-				MoveToEx(mdc, crc.right * 78 / 100, 0, NULL);
-				LineTo(mdc, crc.right * 78 / 100, wTipsHeight * nTraffic);
-				MoveToEx(mdc, crc.right * 87 / 100, 0, NULL);
-				LineTo(mdc, crc.right * 87 / 100, wTipsHeight * nTraffic);
-
-				MoveToEx(mdc, crc.right * 100 / 122, wTipsHeight * nTraffic, NULL);
-				LineTo(mdc, crc.right * 100 / 122, wTipsHeight * (nTraffic + 12));
-				MoveToEx(mdc, crc.right * 100 / 145, wTipsHeight * nTraffic, NULL);
-				LineTo(mdc, crc.right * 100 / 145, wTipsHeight * (nTraffic + 12));
-				MoveToEx(mdc, crc.right * 100 / 156, wTipsHeight * nTraffic, NULL);
-				LineTo(mdc, crc.right * 100 / 156, wTipsHeight * (nTraffic + 12));
-				MoveToEx(mdc, crc.right * 100 / 178, wTipsHeight* nTraffic, NULL);
-				LineTo(mdc, crc.right * 100 / 178, wTipsHeight* (nTraffic + 12));
-
-
-				MoveToEx(mdc, 0, wTipsHeight * nTraffic, NULL);
-				LineTo(mdc, crc.right, wTipsHeight * nTraffic);
-				MoveToEx(mdc, 0, wTipsHeight * (nTraffic + 6), NULL);
-				LineTo(mdc, crc.right, wTipsHeight * (nTraffic + 6));
-				MoveToEx(mdc, 0, wTipsHeight * (nTraffic + 12), NULL);
-				LineTo(mdc, crc.right, wTipsHeight * (nTraffic + 12));
-				MoveToEx(mdc, crc.right * 8 / 100, wTipsHeight * (nTraffic + 12), NULL);
-				LineTo(mdc, crc.right * 8 / 100, wTipsHeight * (nTraffic + 12 + 2));
-				MoveToEx(mdc, crc.right * 92 / 100, wTipsHeight * (nTraffic + 12), NULL);
-				LineTo(mdc, crc.right * 92 / 100, wTipsHeight * (nTraffic + 12 + 2));
-
-				/*
-							DeleteObject(hp);
-							rc.bottom = wTipsHeight*nTraffic;
-							rc.top = 1;
-							rc.left = 5;
-							rc.right = crc.right-5;
-							DWORD max = 0;
-							for (int in=0;in<rNum;in++)
-							{
-								if (max < s_in_bytes[in])
-									max = s_in_bytes[in];
-							}
-							for (int out = 0; out < rNum; out++)
-							{
-								if (max < s_out_bytes[out])
-									max = s_out_bytes[out];
-							}
-							if (max == 0)
-								max = 100;
-							hp = CreatePen(PS_DOT, 1, RGB(128, 255, 0));
-							oldpen = (HPEN)SelectObject(mdc, hp);
-							MoveToEx(mdc, rc.left, rc.bottom, NULL);
-							for (int e=1;e<= rNum;e++)
-							{
-								int x = iBytes + e-1;
-								if (x >= rNum)
-									x -= rNum;
-								LineTo(mdc, rc.left + (rc.right - rc.left) * e / rNum, rc.bottom - double((rc.bottom - rc.top) * s_out_bytes[x] / max ));
-							}
-							SelectObject(mdc, oldpen);
-							DeleteObject(hp);
-
-							hp = CreatePen(PS_SOLID, 1, RGB(255, 128, 0));
-							oldpen = (HPEN)SelectObject(mdc, hp);
-							MoveToEx(mdc, rc.left, rc.bottom, NULL);
-							for (int e = 1; e <= rNum; e++)
-							{
-								int x = iBytes + e - 1;
-								if (x >= rNum)
-									x -= rNum;
-								LineTo(mdc, rc.left + (rc.right - rc.left) *e / rNum, rc.bottom - double((rc.bottom - rc.top) * s_in_bytes[x] / max ));
-							}
-				*/
-
-				SelectObject(mdc, oldpen);
-				DeleteObject(hp);
-				rc.top = 0;
-				/*
-							int cx;
-							if (wTipsHeight < 24)
-								cx = 16;
-							else if (wTipsHeight < 32)
-								cx = 24;
-							else if (wTipsHeight < 48)
-								cx = 32;
-							else if (wTipsHeight < 64)
-								cx = 48;
-							else if (wTipsHeight < 128)
-								cx = 64;
-							else
-								cx = 128;
-				*/
-				//			OffsetRect(&rc, 0, DPI(16)*3);
-							//PIP_ADAPTER_INFO pai = &ipinfo[0];
-				//			PIP_ADAPTER_ADDRESSES paa = &piaa[0];
-				rc.bottom = wTipsHeight;
-				for (int i = 0; i < nTraffic; i++)
-				{
-					rc.left = 5;// +wTipsHeight;
-					DrawText(mdc, traffic[i].FriendlyName, lstrlen(traffic[i].FriendlyName), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					/*
-									HICON hIcon = GetIconForCSIDL(CSIDL_CONNECTIONS);
-
-									UINT size = MAKELPARAM(cx, cx);
-									WCHAR szGuid[64];// = L":::";
-									MultiByteToWideChar(CP_ACP, 0, traffic[i].AdapterName, 64, szGuid , 64);
-									SHFILEINFO shfi;
-									SHGetFileInfo(szGuid, 0, &shfi, sizeof(shfi), SHGFI_ICON | SHGFI_USEFILEATTRIBUTES);
-									hIcon = shfi.hIcon;
-
-									if (wTipsHeight >= 16)
-										DrawIconEx(mdc, 2, rc.top + (rc.bottom - rc.top - cx) / 2, hIcon, cx, cx, 0, NULL, DI_NORMAL);
-									else
-										DrawIconEx(mdc, 1, rc.top + 1, hIcon, wTipsHeight - 2, wTipsHeight - 2, 0, NULL, DI_NORMAL);
-									DestroyIcon(hIcon);
-					*/					
-					rc.left = crc.right * 10 / 31;
-					rc.right = crc.right * 57 / 100;
-					DrawText(mdc, traffic[i].IP4, lstrlen(traffic[i].IP4), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					rc.left = crc.right * 57 / 100;
-					rc.right = crc.right * 66 / 100 - 2;
-					GetTrafficStr(sz, traffic[i].in_bytes, HIWORD(TraySave.iUnit));
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					GetTrafficStr(sz, traffic[i].in_byte, HIWORD(TraySave.iUnit));
-					rc.left = crc.right * 66 / 100 + 2;
-					rc.right = crc.right * 78 / 100-2;
-					DrawText(mdc, L"↓:", 2, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					rc.left = crc.right * 78 / 100 + 2;
-					rc.right = crc.right * 87 / 100 - 2;
-					GetTrafficStr(sz, traffic[i].out_bytes, HIWORD(TraySave.iUnit));
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					GetTrafficStr(sz, traffic[i].out_byte, HIWORD(TraySave.iUnit));
-					rc.left = crc.right * 87 / 100 + 2;
-					rc.right = crc.right - 5;
-					DrawText(mdc, L"↑:", 2, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					OffsetRect(&rc, 0, wTipsHeight);
-				}
-				rc.left = 5;// +wTipsHeight;
-				rc.right = crc.right - 5;
-				POINT pt;
-				GetCursorPos(&pt);
-				ScreenToClient(hDlg, &pt);
-				for (int i = 0; i < 6; i++)
-				{
-					SetTextColor(mdc, RGB(192, 192, 0));
-					DrawText(mdc, ppcu[i]->szExe, lstrlen(ppcu[i]->szExe), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					/*
-									HICON hIcon = OpenProcessIcon(ppcu[i]->dwProcessID,cx);
-									if(wTipsHeight>=16)
-										DrawIconEx(mdc, 2, rc.top + (rc.bottom - rc.top - cx) / 2, hIcon, cx, cx, 0, NULL, DI_NORMAL);
-									else
-										DrawIconEx(mdc, 1, rc.top+1, hIcon, wTipsHeight-2, wTipsHeight-2, 0, NULL, DI_NORMAL);
-									DestroyIcon(hIcon);
-					*/
-					int iCpuUsage = int(ppcu[i]->fCpuUsage * 100);
-					wsprintf(sz, L"%d.%.2d%%", iCpuUsage / 100, iCpuUsage % 100);
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					RECT cr = rc;
-					cr.left = crc.right * 100 / 145;
-					cr.right = crc.right * 100 / 122;
-					wsprintf(sz, L"%d", ppcu[i]->dwProcessID);
-					DrawText(mdc, sz, lstrlen(sz), &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					cr.left = crc.right * 100 / 156;
-					cr.right = crc.right * 100 / 145;
-					if (PtInRect(&cr, pt))
-						SetTextColor(mdc, RGB(255, 255, 255));
-					DrawText(mdc, L"X", 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					SetTextColor(mdc, RGB(192, 192, 0));
-					cr.left = crc.right * 100 / 178;
-					cr.right = crc.right * 100 / 156;
-					if (PtInRect(&cr, pt))
-						SetTextColor(mdc, RGB(255, 255, 255));
-					DrawText(mdc, L"路径", 2, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					OffsetRect(&rc, 0, wTipsHeight);
-				}
-				for (int i = 0; i < 6; i++)
-				{
-					SetTextColor(mdc, RGB(0, 192, 192));
-					DrawText(mdc, ppmu[i]->szExe, lstrlen(ppmu[i]->szExe), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					/*
-									HICON hIcon = OpenProcessIcon(ppmu[i]->dwProcessID,cx);
-									if(wTipsHeight>=16)
-										DrawIconEx(mdc, 2, rc.top+(rc.bottom-rc.top-cx)/2, hIcon, cx, cx, 0, NULL, DI_NORMAL);
-									else
-										DrawIconEx(mdc, 1, rc.top+1, hIcon, wTipsHeight-2, wTipsHeight-2, 0, NULL, DI_NORMAL);
-									DestroyIcon(hIcon);
-					*/
-					if (ppmu[i]->dwMemUsage >= 1048576000)
-					{
-						SIZE_T iMemUsage = (ppmu[i]->dwMemUsage * 100 / 1073741824);
-						wsprintf(sz, L"%d.%.2dGB", iMemUsage / 100, iMemUsage % 100);
-					}
-					else
-					{
-						SIZE_T iMemUsage = (ppmu[i]->dwMemUsage * 100 / 1048576);
-						wsprintf(sz, L"%d.%.2dMB", iMemUsage / 100, iMemUsage % 100);
-					}
-					DrawText(mdc, sz, lstrlen(sz), &rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					RECT cr = rc;
-					cr.left = crc.right * 100 / 145;
-					cr.right = crc.right * 100 / 122;
-					wsprintf(sz, L"%d", ppmu[i]->dwProcessID);
-					DrawText(mdc, sz, lstrlen(sz), &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					cr.left = crc.right * 100 / 156;
-					cr.right = crc.right * 100 / 145;
-					if (PtInRect(&cr, pt))
-						SetTextColor(mdc, RGB(255, 255, 255));
-					DrawText(mdc, L"X", 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					SetTextColor(mdc, RGB(0, 192, 192));
-					cr.left = crc.right * 100 / 178;
-					cr.right = crc.right * 100 / 156;
-					if (PtInRect(&cr, pt))
-						SetTextColor(mdc, RGB(255, 255, 255));
-					DrawText(mdc, L"路径", 2, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-					OffsetRect(&rc, 0, wTipsHeight);
-				}
-
-				HBRUSH hb1, hb2, hb3, hb4;
-				hb1 = CreateSolidBrush(RGB(168, 168, 168));
-				hb2 = CreateSolidBrush(RGB(128, 0, 0));
-				hb3 = CreateSolidBrush(RGB(0, 128, 198));
-				hb4 = CreateSolidBrush(RGB(0, 148, 0));
-				SetTextColor(mdc, RGB(255, 255, 255));
-				/*
-							HBRUSH hb;
-							hb=CreateSolidBrush(RGB(0,38,0));
-							FillRect(mdc, &rc, hb);
-							DeleteObject(hb);
-				*/
-				WCHAR wDrive[MAX_PATH];
-				DWORD dwLen = GetLogicalDriveStrings(MAX_PATH, wDrive);
-				if (dwLen != 0)
-				{
-					DWORD driver_number = dwLen / 4;
-					rc.left = crc.right * 8 / 100 + 3;
-					int dw = crc.right * 84 / 100 / driver_number - 2;
-					rc.right = rc.left + dw;
-					rc.top += 3;
-					rc.bottom -= 1;
-					for (DWORD nIndex = 0; nIndex < driver_number; nIndex++)
-					{
-						LPWSTR dName = wDrive + nIndex * 4;
-						UINT64 lpFreeBytesAvailable = 0;
-						UINT64 lpTotalNumberOfBytes = 0;
-						UINT64 lpTotalNumberOfFreeBytes = 0;
-						if (GetDriveType(dName) != DRIVE_CDROM && dName[0] != L'A')
-						{
-							if (GetDiskFreeSpaceEx(dName, (PULARGE_INTEGER)&lpFreeBytesAvailable, (PULARGE_INTEGER)&lpTotalNumberOfBytes, (PULARGE_INTEGER)&lpTotalNumberOfFreeBytes))
-							{
-								RECT frc = rc;
-								if (nIndex + 1 == driver_number)
-									rc.right = crc.right * 92 / 100 - 2;
-								frc.right = frc.left + (rc.right - rc.left) * (lpTotalNumberOfBytes - lpTotalNumberOfFreeBytes) / lpTotalNumberOfBytes;
-								FillRect(mdc, &rc, hb1);
-								if (lpTotalNumberOfFreeBytes < lpTotalNumberOfBytes * 1 / 10)
-									FillRect(mdc, &frc, hb2);
-								else
-									FillRect(mdc, &frc, hb3);
-							}
-							dName[2] = 0;
-						}
-						DrawText(mdc, dName, lstrlen(dName), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-						OffsetRect(&rc, dw + 2, 0);
-						if (rc.right - 3 > crc.right * 92 / 100)
-							break;
-					}
-				}
-				rc.top -= 2;
-				rc.bottom -= 2;
-				OffsetRect(&rc, 0, wTipsHeight);
-				rc.left = crc.right * 50 / 100 + 1;
-				rc.right = crc.right * 92 / 100 - 2;
-				FillRect(mdc, &rc, hb1);
-
-				rc.left = crc.right * 8 / 100 + 3;
-				rc.right = crc.right * 50 / 100 - 1;
-				FillRect(mdc, &rc, hb1);
-				/*
-							PROCESSOR_POWER_INFORMATION* pi = (PROCESSOR_POWER_INFORMATION*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof PROCESSOR_POWER_INFORMATION*dNumProcessor);
-							if (pCallNtPowerInformation(ProcessorInformation, NULL, 0, &pi[0], sizeof PROCESSOR_POWER_INFORMATION * dNumProcessor) == 0)
-							{
-								int iCGhz = pi[0].CurrentMhz / 10;
-								int iMGhz = pi[0].MaxMhz / 10;
-								wsprintf(sz,  L"%d个逻辑处理器 当前频率%d.%.2dGHz 最大频率%d.%.2dGHz", dNumProcessor, iCGhz/100,iCGhz%100, iMGhz / 100, iMGhz % 100);
-							}
-							HeapFree(GetProcessHeap(), 0,pi);
-							DrawText(mdc, sz, lstrlen(sz), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-				*/
-
-				DWORDLONG iaPage = MemoryStatusEx.ullAvailPageFile * 100 / 1073741824;
-				DWORDLONG itPage = MemoryStatusEx.ullTotalPageFile * 100 / 1073741824;
-				DWORDLONG ia = MemoryStatusEx.ullAvailPhys * 100 / 1073741824;
-				DWORDLONG it = MemoryStatusEx.ullTotalPhys * 100 / 1073741824;
-
-				RECT frc = rc;
-				frc.right = frc.left + (rc.right - rc.left) * (itPage - iaPage) / itPage;
-				if (iaPage < itPage * 2 / 10)
-					FillRect(mdc, &frc, hb2);
-				else
-					FillRect(mdc, &frc, hb4);
-				wsprintf(sz, L"虚拟内存:%d.%.2d/%d.%.2dGB", iaPage / 100, iaPage % 100, itPage / 100, itPage % 100);
-				DrawText(mdc, sz, lstrlen(sz), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-				rc.left = crc.right * 50 / 100 + 1;
-				rc.right = crc.right * 92 / 100 - 2;
-				frc = rc;
-				frc.right = frc.left + (rc.right - rc.left) * (it - ia) / it;
-				if (ia < it * 2 / 10)
-					FillRect(mdc, &frc, hb2);
-				else
-					FillRect(mdc, &frc, hb4);
-				DeleteObject(hb1);
-				DeleteObject(hb2);
-				DeleteObject(hb3);
-				DeleteObject(hb4);
-				wsprintf(sz, L"物理内存:%d.%.2d/%d.%.2dGB", ia / 100, ia % 100, it / 100, it % 100);
-				DrawText(mdc, sz, lstrlen(sz), &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-				WCHAR set[] = L"设置";
-				WCHAR sexit[] = L"退出";
-				rc.top -= wTipsHeight;
-				rc.right = crc.right * 8 / 100;
-				rc.left = 0;
-				DrawText(mdc, set, lstrlen(set), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-				rc.right = crc.right;
-				rc.left = crc.right * 92 / 100;
-				DrawText(mdc, sexit, lstrlen(sexit), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-				SelectObject(mdc, oldFont);//先选回旧字体再删除，否则字体还选在 DC 里删不掉，每次重绘泄漏一个
-				DeleteObject(hTipsFont);
-			}
-			GetClientRect(hDlg, &rc);
-			BitBlt(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mdc, 0, 0, SRCCOPY);
-			SelectObject(mdc, oldBmp);
-			DeleteObject(hMemBmp);
-			DeleteDC(mdc);
-		}
-		return TRUE;
-		break;
-	}
-	return (INT_PTR)FALSE;
+	return FALSE;
 }
 void GetProcessCpuUsage()//获取进程CPU占用前五
 {
+	ULONGLONG now = GetTickCount64();
+	if (tProcCpu && now - tProcCpu < 500)//离上次采样太近，CPU 时间精度（15.6ms）不够，留着上次的基准
+		return;
+	float span = tProcCpu ? (float)(now - tProcCpu) : 1000.f;
 	if (!inTipsProcessX)
 	{
 		ppcu[0] = &pcu[0];
@@ -2866,137 +2476,103 @@ void GetProcessCpuUsage()//获取进程CPU占用前五
 	if (pProcessTime == NULL)
 		return;
 	DWORD dCurID = GetCurrentProcessId();
-	PROCESSENTRY32 pe;
-	pe.dwSize = sizeof(PROCESSENTRY32);
-	HANDLE hs = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (hs != INVALID_HANDLE_VALUE)
+	for (FSPI* sp = ProcSnapshot(); sp; sp = sp->NextEntryOffset ? (FSPI*)((BYTE*)sp + sp->NextEntryOffset) : NULL)
 	{
-		BOOL ret = Process32First(hs, &pe);
-		while (ret)
+		DWORD pid = (DWORD)(ULONG_PTR)sp->UniqueProcessId;
+		if (pid == 0 || pid == dCurID)//0 是系统空闲进程
+			continue;
+		int n = -1;
+		for (int i = 0; i < nCap; i++)//原来按当前进程数 +31 遍历，进程变多时会越界
 		{
-			if (pe.th32ProcessID != dCurID)
+			if (pProcessTime[i].dwProcessID == pid)
 			{
-				HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-				if (hProc)
-				{
-					int n = -1;
-					for (int i = 0; i < nCap; i++)//原来按当前进程数 +31 遍历，进程变多时会越界
-					{
-						if (pProcessTime[i].dwProcessID == pe.th32ProcessID)
-						{
-							n = i;
-							break;
-						}
-						else if (n == -1 && pProcessTime[i].dwProcessID == NULL)
-							n = i;
-					}
-					FILETIME CreateTime, ExitTime, KernelTime, UserTime;
-					if (n != -1 && GetProcessTimes(hProc, &CreateTime, &ExitTime, &KernelTime, &UserTime))//没有空位时跳过，原来会写 pProcessTime[-1]
-					{
-						float nProcCpuPercent = 0;
-						BOOL bRetCode = FALSE;
-						FILETIME CreateTime, ExitTime, KernelTime, UserTime;
-						LARGE_INTEGER lgKernelTime;
-						LARGE_INTEGER lgUserTime;
-						LARGE_INTEGER lgCurTime;
-
-						bRetCode = GetProcessTimes(hProc, &CreateTime, &ExitTime, &KernelTime, &UserTime);
-						if (bRetCode)
-						{
-							lgKernelTime.HighPart = KernelTime.dwHighDateTime;
-							lgKernelTime.LowPart = KernelTime.dwLowDateTime;
-
-							lgUserTime.HighPart = UserTime.dwHighDateTime;
-							lgUserTime.LowPart = UserTime.dwLowDateTime;
-
-							lgCurTime.QuadPart = (lgKernelTime.QuadPart + lgUserTime.QuadPart) / 10000;
-							if (pProcessTime[n].g_slgProcessTimeOld.QuadPart == 0)
-								nProcCpuPercent = 0;
-							else
-								nProcCpuPercent = (float)((lgCurTime.QuadPart - pProcessTime[n].g_slgProcessTimeOld.QuadPart) * 100 / 1000);
-							pProcessTime[n].g_slgProcessTimeOld = lgCurTime;
-							pProcessTime[n].dwProcessID = pe.th32ProcessID;
-							nProcCpuPercent = nProcCpuPercent / dNumProcessor;
-						}
-						else
-						{
-							nProcCpuPercent = 0;
-						}
-						if (nProcCpuPercent > 100)
-							nProcCpuPercent = 0;
-						if (!inTipsProcessX)
-						{
-							PROCESSCPUUSAGE* ppc;
-							if (ppcu[0]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppc = ppcu[5];
-								ppcu[5] = ppcu[4];
-								ppcu[4] = ppcu[3];
-								ppcu[3] = ppcu[2];
-								ppcu[2] = ppcu[1];
-								ppcu[1] = ppcu[0];
-								ppcu[0] = ppc;
-								ppcu[0]->dwProcessID = pe.th32ProcessID;
-								ppcu[0]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[0]->szExe, pe.szExeFile, 36);
-							}
-							else if (ppcu[1]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppc = ppcu[5];
-								ppcu[5] = ppcu[4];
-								ppcu[4] = ppcu[3];
-								ppcu[3] = ppcu[2];
-								ppcu[2] = ppcu[1];
-								ppcu[1] = ppc;
-								ppcu[1]->dwProcessID = pe.th32ProcessID;
-								ppcu[1]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[1]->szExe, pe.szExeFile, 36);
-							}
-							else if (ppcu[2]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppc = ppcu[5];
-								ppcu[5] = ppcu[4];
-								ppcu[4] = ppcu[3];
-								ppcu[3] = ppcu[2];
-								ppcu[2] = ppc;
-								ppcu[2]->dwProcessID = pe.th32ProcessID;
-								ppcu[2]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[2]->szExe, pe.szExeFile, 36);
-							}
-							else if (ppcu[3]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppc = ppcu[5];
-								ppcu[5] = ppcu[4];
-								ppcu[4] = ppcu[3];
-								ppcu[3] = ppc;
-								ppcu[3]->dwProcessID = pe.th32ProcessID;
-								ppcu[3]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[3]->szExe, pe.szExeFile, 36);
-							}
-							else if (ppcu[4]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppc = ppcu[5];
-								ppcu[5] = ppcu[4];
-								ppcu[4] = ppc;
-								ppcu[4]->dwProcessID = pe.th32ProcessID;
-								ppcu[4]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[4]->szExe, pe.szExeFile, 36);
-							}
-							else if (ppcu[5]->fCpuUsage <= nProcCpuPercent)
-							{
-								ppcu[5]->dwProcessID = pe.th32ProcessID;
-								ppcu[5]->fCpuUsage = nProcCpuPercent;
-								lstrcpyn(ppcu[5]->szExe, pe.szExeFile, 36);
-							}
-						}
-					}
-					CloseHandle(hProc);
-				}
+				n = i;
+				break;
 			}
-			ret = Process32Next(hs, &pe);
+			else if (n == -1 && pProcessTime[i].dwProcessID == NULL)
+				n = i;
 		}
-		CloseHandle(hs);
+		if (n == -1)//没有空位时跳过，原来会写 pProcessTime[-1]
+			continue;
+		LONGLONG lgCurTime = (sp->KernelTime.QuadPart + sp->UserTime.QuadPart) / 10000;
+		float nProcCpuPercent = 0;
+		if (pProcessTime[n].g_slgProcessTimeOld.QuadPart != 0)
+			nProcCpuPercent = (lgCurTime - pProcessTime[n].g_slgProcessTimeOld.QuadPart) * 100.f / span;//按实际间隔算，原来按固定 1 秒
+		pProcessTime[n].g_slgProcessTimeOld.QuadPart = lgCurTime;
+		pProcessTime[n].dwProcessID = pid;
+		nProcCpuPercent = nProcCpuPercent / dNumProcessor;
+		if (nProcCpuPercent > 100)
+			nProcCpuPercent = 0;
+		if (!inTipsProcessX)
+		{
+			WCHAR szExe[36];
+			ProcName(sp, szExe);
+			PROCESSCPUUSAGE* ppc;
+			if (ppcu[0]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppc = ppcu[5];
+				ppcu[5] = ppcu[4];
+				ppcu[4] = ppcu[3];
+				ppcu[3] = ppcu[2];
+				ppcu[2] = ppcu[1];
+				ppcu[1] = ppcu[0];
+				ppcu[0] = ppc;
+				ppcu[0]->dwProcessID = pid;
+				ppcu[0]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[0]->szExe, szExe, 36);
+			}
+			else if (ppcu[1]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppc = ppcu[5];
+				ppcu[5] = ppcu[4];
+				ppcu[4] = ppcu[3];
+				ppcu[3] = ppcu[2];
+				ppcu[2] = ppcu[1];
+				ppcu[1] = ppc;
+				ppcu[1]->dwProcessID = pid;
+				ppcu[1]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[1]->szExe, szExe, 36);
+			}
+			else if (ppcu[2]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppc = ppcu[5];
+				ppcu[5] = ppcu[4];
+				ppcu[4] = ppcu[3];
+				ppcu[3] = ppcu[2];
+				ppcu[2] = ppc;
+				ppcu[2]->dwProcessID = pid;
+				ppcu[2]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[2]->szExe, szExe, 36);
+			}
+			else if (ppcu[3]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppc = ppcu[5];
+				ppcu[5] = ppcu[4];
+				ppcu[4] = ppcu[3];
+				ppcu[3] = ppc;
+				ppcu[3]->dwProcessID = pid;
+				ppcu[3]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[3]->szExe, szExe, 36);
+			}
+			else if (ppcu[4]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppc = ppcu[5];
+				ppcu[5] = ppcu[4];
+				ppcu[4] = ppc;
+				ppcu[4]->dwProcessID = pid;
+				ppcu[4]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[4]->szExe, szExe, 36);
+			}
+			else if (ppcu[5]->fCpuUsage <= nProcCpuPercent)
+			{
+				ppcu[5]->dwProcessID = pid;
+				ppcu[5]->fCpuUsage = nProcCpuPercent;
+				lstrcpyn(ppcu[5]->szExe, szExe, 36);
+			}
+		}
 	}
+	bProcCpuReady = tProcCpu != 0;//第一次只是建基准，数值都是 0
+	tProcCpu = now;
 }
 int GetProcessMemUsage()//获取进程内存占用前五
 {
@@ -3016,97 +2592,83 @@ int GetProcessMemUsage()//获取进程内存占用前五
 		pmu[4].dwMemUsage = 0;
 		pmu[5].dwMemUsage = 0;
 	}
-	PROCESSENTRY32 pe;
-	pe.dwSize = sizeof(PROCESSENTRY32);
 	int n = 0;
-	HANDLE hs = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (hs != INVALID_HANDLE_VALUE)
+	for (FSPI* sp = ProcSnapshot(); sp; sp = sp->NextEntryOffset ? (FSPI*)((BYTE*)sp + sp->NextEntryOffset) : NULL)
 	{
-		BOOL ret = Process32First(hs, &pe);
-		while (ret)
+		++n;
+		DWORD pid = (DWORD)(ULONG_PTR)sp->UniqueProcessId;
+		if (pid == 0 || inTipsProcessX)
+			continue;
+		WCHAR szExe[36];
+		ProcName(sp, szExe);
+		if (lstrcmp(szExe, L"Memory Compression") == 0)
+			continue;
+		SIZE_T ws = sp->WorkingSetSize;
+		PROCESSMEMORYUSAGE* ppm;
+		if (ppmu[0]->dwMemUsage <= ws)
 		{
-			++n;
-			if (lstrcmp(pe.szExeFile, L"Memory Compression") != 0 && !inTipsProcessX)
-			{
-				HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-				if (hProc)
-				{
-					PROCESS_MEMORY_COUNTERS_EX pmc;
-					if (GetProcessMemoryInfo(hProc, (PPROCESS_MEMORY_COUNTERS)&pmc, sizeof(pmc)))
-					{
-						//QueryWorkingSet()
-						PROCESSMEMORYUSAGE* ppm;
-						if (ppmu[0]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppm = ppmu[5];
-							ppmu[5] = ppmu[4];
-							ppmu[4] = ppmu[3];
-							ppmu[3] = ppmu[2];
-							ppmu[2] = ppmu[1];
-							ppmu[1] = ppmu[0];
-							ppmu[0] = ppm;
-							ppmu[0]->dwProcessID = pe.th32ProcessID;
-							ppmu[0]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[0]->szExe, pe.szExeFile, 36);
+			ppm = ppmu[5];
+			ppmu[5] = ppmu[4];
+			ppmu[4] = ppmu[3];
+			ppmu[3] = ppmu[2];
+			ppmu[2] = ppmu[1];
+			ppmu[1] = ppmu[0];
+			ppmu[0] = ppm;
+			ppmu[0]->dwProcessID = pid;
+			ppmu[0]->dwMemUsage = ws;
+			lstrcpyn(ppmu[0]->szExe, szExe, 36);
 
-						}
-						else if (ppmu[1]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppm = ppmu[5];
-							ppmu[5] = ppmu[4];
-							ppmu[4] = ppmu[3];
-							ppmu[3] = ppmu[2];
-							ppmu[2] = ppmu[1];
-							ppmu[1] = ppm;
-							ppmu[1]->dwProcessID = pe.th32ProcessID;
-							ppmu[1]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[1]->szExe, pe.szExeFile, 36);
-
-						}
-						else if (ppmu[2]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppm = ppmu[5];
-							ppmu[5] = ppmu[4];
-							ppmu[4] = ppmu[3];
-							ppmu[3] = ppmu[2];
-							ppmu[2] = ppm;
-							ppmu[2]->dwProcessID = pe.th32ProcessID;
-							ppmu[2]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[2]->szExe, pe.szExeFile, 36);
-
-						}
-						else if (ppmu[3]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppm = ppmu[5];
-							ppmu[5] = ppmu[4];
-							ppmu[4] = ppmu[3];
-							ppmu[3] = ppm;
-							ppmu[3]->dwProcessID = pe.th32ProcessID;
-							ppmu[3]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[3]->szExe, pe.szExeFile, 36);
-						}
-						else if (ppmu[4]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppm = ppmu[5];
-							ppmu[5] = ppmu[4];
-							ppmu[4] = ppm;
-							ppmu[4]->dwProcessID = pe.th32ProcessID;
-							ppmu[4]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[4]->szExe, pe.szExeFile, 36);
-						}
-						else if (ppmu[5]->dwMemUsage <= pmc.WorkingSetSize)
-						{
-							ppmu[5]->dwProcessID = pe.th32ProcessID;
-							ppmu[5]->dwMemUsage = pmc.WorkingSetSize;
-							lstrcpyn(ppmu[5]->szExe, pe.szExeFile, 36);
-						}
-					}
-					CloseHandle(hProc);
-				}
-			}
-			ret = Process32Next(hs, &pe);
 		}
-		CloseHandle(hs);
+		else if (ppmu[1]->dwMemUsage <= ws)
+		{
+			ppm = ppmu[5];
+			ppmu[5] = ppmu[4];
+			ppmu[4] = ppmu[3];
+			ppmu[3] = ppmu[2];
+			ppmu[2] = ppmu[1];
+			ppmu[1] = ppm;
+			ppmu[1]->dwProcessID = pid;
+			ppmu[1]->dwMemUsage = ws;
+			lstrcpyn(ppmu[1]->szExe, szExe, 36);
+
+		}
+		else if (ppmu[2]->dwMemUsage <= ws)
+		{
+			ppm = ppmu[5];
+			ppmu[5] = ppmu[4];
+			ppmu[4] = ppmu[3];
+			ppmu[3] = ppmu[2];
+			ppmu[2] = ppm;
+			ppmu[2]->dwProcessID = pid;
+			ppmu[2]->dwMemUsage = ws;
+			lstrcpyn(ppmu[2]->szExe, szExe, 36);
+
+		}
+		else if (ppmu[3]->dwMemUsage <= ws)
+		{
+			ppm = ppmu[5];
+			ppmu[5] = ppmu[4];
+			ppmu[4] = ppmu[3];
+			ppmu[3] = ppm;
+			ppmu[3]->dwProcessID = pid;
+			ppmu[3]->dwMemUsage = ws;
+			lstrcpyn(ppmu[3]->szExe, szExe, 36);
+		}
+		else if (ppmu[4]->dwMemUsage <= ws)
+		{
+			ppm = ppmu[5];
+			ppmu[5] = ppmu[4];
+			ppmu[4] = ppm;
+			ppmu[4]->dwProcessID = pid;
+			ppmu[4]->dwMemUsage = ws;
+			lstrcpyn(ppmu[4]->szExe, szExe, 36);
+		}
+		else if (ppmu[5]->dwMemUsage <= ws)
+		{
+			ppmu[5]->dwProcessID = pid;
+			ppmu[5]->dwMemUsage = ws;
+			lstrcpyn(ppmu[5]->szExe, szExe, 36);
+		}
 	}
 	return n;
 }
@@ -3378,20 +2940,20 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			SetTrackMouseEvent(hTaskBar, TME_LEAVE | TME_HOVER);
 			bEvent = TRUE;
 		}
+		FBarHoverUpdate();
 		break;
 	case WM_MOUSEHOVER:
 	{
-		if (!IsWindowVisible(hTaskTips)&&TraySave.bMonitorTips)
+		if (IsWindow(hTaskTips) && fly.anim == 2)//正在关闭时又回到状态条：接着打开
+			FlyCancelClose(hTaskTips);
+		else if (!IsWindowVisible(hTaskTips)&&TraySave.bMonitorTips)
 		{
 /*
 			if (s_in_byte == 0)
 				return FALSE;
 */
 			if (!IsWindow(hTaskTips))
-			{
-				hTaskTips = ::CreateDialog(hInst, MAKEINTRESOURCE(IDD_TIPS), NULL, (DLGPROC)TaskTipsProc);
-				SetLayeredWindowAttributes(hTaskTips, 0, 255, LWA_ALPHA);
-			}
+				hTaskTips = ::CreateDialog(hInst, MAKEINTRESOURCE(IDD_TIPS), NULL, (DLGPROC)TaskTipsProc);//分层窗口，内容用 UpdateLayeredWindow 显示
 			EnterCriticalSection(&csProcess);
 			nProcess = GetProcessMemUsage();
 			if (pProcessTime == NULL)
@@ -3402,35 +2964,7 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			}
 			GetProcessCpuUsage();
 			LeaveCriticalSection(&csProcess);
-			HDC mdc = GetDC(hMain);
-			TraySave.TipsFont.lfHeight = DPI(TraySave.TipsFontSize);
-			HFONT hTipsFont = CreateFontIndirect(&TraySave.TipsFont); //创建字体
-			HFONT oldFont = (HFONT)SelectObject(mdc, hTipsFont);
-			SIZE tSize;
-			::GetTextExtentPoint(mdc, L"虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存", 36, &tSize);
-			SelectObject(mdc, oldFont);
-			DeleteObject(hTipsFont);
-			::ReleaseDC(hMain, mdc);
-			int x, y, w, h;
-			w = tSize.cx;
-			wTipsHeight = tSize.cy;
-			h = wTipsHeight * (nTraffic + 14);
-			RECT wrc, src;
-			GetWindowRect(hDlg, &wrc);
-			GetScreenRect(hDlg, &src, TRUE);
-			if (wrc.bottom + h > src.bottom)
-				y = wrc.top - h;
-			else
-				y = wrc.bottom;
-			if (wrc.right - (wrc.right - wrc.left) / 2 + w / 2 > src.right)
-				x = src.right - w;
-			else if (wrc.right - (wrc.right - wrc.left) / 2 - w / 2 < src.left)
-				x = src.left;
-			else
-				x = wrc.right - (wrc.right - wrc.left) / 2 - w / 2;
-			SetWindowPos(hTaskTips, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-			HRGN hRgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 11, 11);
-			SetWindowRgn(hTaskTips, hRgn, FALSE);
+			FlyOpen(hTaskTips, hTaskBar);
 //			SetCursorPos(2498, 1398);
 //			mouse_event(MOUSEEVENTF_MOVE, 2380, 1398, 0, 0);
 //			mouse_event(MOUSEEVENTF_LEFTDOWN, 2500, 1398, 0, 0);
@@ -3440,6 +2974,7 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 	break;
 	case WM_MOUSELEAVE:
 		bEvent = FALSE;
+		FBarHoverUpdate();
 		break;
 	case  WM_RBUTTONDOWN:
 	{
@@ -3584,36 +3119,13 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 					if (TraySave.dNumValues2[2] != 0 && (TrayData->diskreadbyte / 1024 / 1024 > TraySave.dNumValues2[2] || TrayData->diskwritebyte / 1024 / 1024 > TraySave.dNumValues2[2]))
 						MessageBeep(MB_ICONHAND);
 			}
-			POINT pt;
-			GetCursorPos(&pt);
-			RECT brc;
-			GetWindowRect(hTaskBar, &brc);
-			if (PtInRect(&brc, pt))
-			{
-				if (rovi.dwBuildNumber >= 22000 && !TraySave.bMonitorFloat)//&&TraySave.cMonitorColor[0]==RGB(0,0,1))
-				{
-					if (!bFullScreen)
-					{
-
-						if (!KEYDOWN(VK_LBUTTON) && !IsWindow(hTaskTips))
-						{
-							SendMessage(hTaskBar, WM_MOUSEHOVER, 0, 0);
-						}
-					}
-				}
-				break;
-			}
-			if (TraySave.bMonitorTips)
-			{
-				if (IsWindow(hTaskTips))
-				{
-					GetWindowRect(hTaskTips, &brc);
-					if (!PtInRect(&brc, pt))
-					{
-						DestroyWindow(hTaskTips);
-					}
-				}
-			}
+		}
+		else if (wParam == 7)
+			FBarHoverStep();
+		else if (wParam == 8)//Win11 悬停轮询（原来在定时器 3 里一秒一次，打开要等 0~1 秒）
+		{
+			if (!TraySave.bMonitorFloat)
+				FBarPoll();
 		}
 		break;//原来缺 break，会把定时器编号当 HDC 落到 WM_ERASEBKGND
 	case WM_ERASEBKGND:
@@ -3621,6 +3133,7 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		//		PAINTSTRUCT ps;
 		HDC hdc = (HDC)wParam;//BeginPaint(hDlg, &ps);		
 		HDC mdc = CreateCompatibleDC(hdc);
+		BOOL bFluentBar = FALSE;
 		if (mdc)
 		{
 			RECT rc;
@@ -3629,9 +3142,9 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			HBITMAP oldBmp = (HBITMAP)SelectObject(mdc, hMemBmp);
 			//		if (TraySave.cMonitorColor[0] != 0)
 			{
-				HBRUSH hb;
+				COLORREF cBg;//底色（新样式按它的亮度选文字颜色）
 				if (TraySave.cMonitorColor[0] != RGB(0, 0, 1)&& TraySave.cMonitorColor[0] != RGB(0, 0, 2))
-					hb = CreateSolidBrush(TraySave.cMonitorColor[0]);
+					cBg = TraySave.cMonitorColor[0];
 				else
 				{
 
@@ -3652,15 +3165,18 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 								SetLayeredWindowAttributes(hTaskBar, cPixel, 0, LWA_COLORKEY);
 							}
 						}
-						hb = CreateSolidBrush(oPixelColor);
+						cBg = oPixelColor;
 					}
 					else
-						hb = CreateSolidBrush(RGB(0, 0, 1));
+						cBg = RGB(0, 0, 1);
 				}
+				HBRUSH hb = CreateSolidBrush(cBg);
 				FillRect(mdc, &rc, hb);
 				DeleteObject(hb);
+				bFluentBar = FBarPaint(mdc, rc, cBg);
 			}
 			//		if (bErasebkgnd)
+			if (!bFluentBar)//Direct2D 不可用时用原来的 GDI 绘制
 			{
 //				InflateRect(&rc, -1, -1);
 				if(VTray)
@@ -4067,9 +3583,9 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 				SelectObject(mdc, oldFont);
 			}
 			//		GetClientRect(hDlg, &rc);
-			if (VTray)
+			if (VTray && !bFluentBar)
 				InflateRect(&rc, wSpace / 2, 0);
-			if(TraySave.bMonitorFuse)/////////////////背景融合
+			if(TraySave.bMonitorFuse && !bFluentBar)/////////////////背景融合（新样式自己输出预乘 alpha，不再改）
 			{
 				BYTE* lpvBits = NULL;
 
@@ -4312,7 +3828,9 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 }
 INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)//设置窗口过程
 {
-	UNREFERENCED_PARAMETER(lParam);
+	INT_PTR fr;
+	if (FSetProc(hDlg, message, wParam, lParam, &fr))//新界面的绘制、导航（在 FluentSet.h）
+		return fr;
 	switch (message)
 	{
 	case WM_INITDIALOG:
@@ -4802,6 +4320,12 @@ INT_PTR CALLBACK ColorButtonProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 	{
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hWnd, &ps);
+		if (fs.h)//新界面画成色块
+		{
+			FSetDrawSwatch(hWnd, hdc);
+			EndPaint(hWnd, &ps);
+			return TRUE;
+		}
 		RECT rc;
 		GetClientRect(hWnd, &rc);
 		HBRUSH hb;
