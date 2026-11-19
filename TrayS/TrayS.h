@@ -18,6 +18,7 @@
 #include "adl_sdk.h"
 
 #define MSG_APPBAR_MSGID WM_USER+15//全屏幕消息
+#define WM_TRAYS_RECREATE WM_USER+16//让 UI 线程销毁任务栏窗口，下个刷新周期重建
 #define  WM_IAWENTRAY WM_USER+8//通知栏消息
 #define  WM_TRAYS WM_USER+8888//打开设置消息
 #define KEYDOWN(vk_code) ((GetAsyncKeyState(vk_code) & 0x8000) ? 1 : 0)
@@ -110,7 +111,6 @@ HWND hSetting;//设置窗口句柄
 HWND hTaskBar;//工具窗口句柄
 HWND hTaskTips;//提示窗口句柄
 HWND hTime;//秒窗口
-HWND hPrice;//行情窗口
 //HWND hForeground;
 HWND hTray=NULL;//系统主任务栏窗口句柄
 HWND hTaskWnd;//系统主任务列表窗口句柄
@@ -139,12 +139,6 @@ typedef struct _TRAYDATA
 	ULONG64 m_last_out_bytes;//总上一秒上传速度
 	ULONG64 s_in_byte;//总下载速度
 	ULONG64 s_out_byte;//总上传速度
-	float fLastPrice1,fLastPrice2, fOpenPrice1, fOpenPrice2, fLastPrice3, fLastPrice4, fOpenPrice3, fOpenPrice4;//行情当前与昨天
-	WCHAR szLastPrice1[16];//行情数值字符串
-	WCHAR szLastPrice2[16];//行情数值字符串
-	WCHAR szLastPrice3[16];//行情数值字符串
-	WCHAR szLastPrice4[16];//行情数值字符串
-	int iPriceUpDown[4];//行情升降提醒
 	DWORD iHddTemperature;//硬盘温度
 	DWORD iTemperature1;//CPU温度
 	DWORD iTemperature2;//GPU温度
@@ -161,7 +155,6 @@ typedef struct _TRAYDATA
 TRAYDATA* TrayData;
 PMIB_IFTABLE mi;//网速结构
 PIP_ADAPTER_ADDRESSES piaa;//网卡结构
-PMIB_IF_TABLE2 mit2;//网速结构
 TRAFFIC* traffic;//每个网卡速度
 int nTraffic = 0;//有几张网卡
 
@@ -177,7 +170,6 @@ DWORD WINAPI MainThreadProc(PVOID pParam);
 DWORD WINAPI GetDataThreadProc(PVOID pParam);
 //HANDLE hMainThread = NULL;
 HANDLE hGetDataThread = NULL;
-HANDLE hPriceThread = NULL;
 HANDLE hMap = NULL;
 BOOL bShadow = FALSE;//显示阴影文字
 COLORREF bColor = 0x181818;//阴影颜色
@@ -240,7 +232,7 @@ typedef struct _TRAYSAVE//默认参数
 	WCHAR szDiskWriteSec[8];//硬盘写入显示的文字
 	WCHAR szDiskName[8];//硬盘名称
 	WCHAR szDisk;//盘符
-	BOOL bMonitorPrice;//显示行情
+	BOOL bMonitorPrice;//行情功能已移除。从这里到 cPriceColor 的字段只为兼容旧 TrayS.dat 的二进制布局而保留，不要删
 	float HighRemind[12];//超过价格提醒
 	float LowRemind[12];//低过价格提醒
 	BOOL bCheckHighRemind[12];
@@ -325,7 +317,6 @@ int wTemperature;//温度宽度
 int wUsage;//利用率宽度
 int wDisk;//硬盘流量宽度
 int wTime;//时间宽度
-int wPrice;//行情宽度
 int wHeight;//监控字符高度
 POINT pTime;//秒位置
 HFONT hFont;//监控窗口字体
@@ -345,6 +336,8 @@ PROCESSCPUUSAGE pcu[6];
 PROCESSCPUUSAGE *ppcu[6];
 int nProcess;
 PROCESSTIME * pProcessTime;
+int nProcessTimeCap = 0;//pProcessTime 实际分配的条数，遍历不能超过它
+CRITICAL_SECTION csProcess;//界面线程（悬停）和数据线程都会分配、刷新、释放 pProcessTime，用它串行化
 
 //BOOL bTaskOther = FALSE;
 
@@ -365,10 +358,8 @@ typedef ULONG(WINAPI* pfnGetAdaptersAddresses)(_In_ ULONG Family, _In_ ULONG Fla
 typedef DWORD(WINAPI* pfnGetIfTable)(_Out_writes_bytes_opt_(*pdwSize) PMIB_IFTABLE pIfTable, _Inout_ PULONG pdwSize, _In_ BOOL bOrder);
 pfnGetAdaptersAddresses GetAdaptersAddressesT;
 pfnGetIfTable GetIfTableT;
-typedef DWORD(WINAPI* pfnGetIfTable2)(PMIB_IF_TABLE2* Table);
-pfnGetIfTable2 getIfTable2;
-typedef VOID (WINAPI* pfnFreeMibTable)(PVOID Memory);
-pfnFreeMibTable freeMibTable;
+typedef DWORD(WINAPI* pfnGetIfEntry2)(PMIB_IF_ROW2 Row);
+pfnGetIfEntry2 getIfEntry2;
 HMODULE hOleacc=NULL;
 typedef ULONG(WINAPI* pfnAccessibleObjectFromWindow)(_In_ HWND hwnd, _In_ DWORD dwId, _In_ REFIID riid, _Outptr_ void** ppvObject);
 typedef ULONG(WINAPI* pfnAccessibleChildren)(_In_ IAccessible* paccContainer, _In_ LONG iChildStart, _In_ LONG cChildren, _Out_writes_(cChildren) VARIANT* rgvarChildren, _Out_ LONG* pcObtained);
@@ -521,7 +512,6 @@ INT_PTR CALLBACK    SettingProc(HWND, UINT, WPARAM, LPARAM);//设置窗口过程
 INT_PTR CALLBACK    TaskBarProc(HWND, UINT, WPARAM, LPARAM);//任务栏监控窗口过程
 INT_PTR CALLBACK    TaskTipsProc(HWND, UINT, WPARAM, LPARAM);//提示窗口过程
 INT_PTR CALLBACK    TimeProc(HWND, UINT, WPARAM, LPARAM);//秒窗口过程
-INT_PTR CALLBACK    PriceProc(HWND, UINT, WPARAM, LPARAM);//行情窗口过程
 void SetTaskBarPos(HWND, HWND, HWND, HWND, BOOL);//设置任务栏图标位置
 int DrawShadowText(HDC hDC, LPCTSTR lpString, int nCount, LPRECT lpRect, UINT uFormat);//绘制阴影文字
 void FreeTemperatureDLL();//
@@ -531,4 +521,3 @@ int GetProcessMemUsage();//获取内存使用大小
 void GetProcessCpuUsage();//获取进程CPU使用率
 void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit,int iUnit=0);//流量转字符串
 void ShowSelectMenu(BOOL bNet);//显示网卡/硬盘菜单
-void DrawPrice(HDC mdc, LPRECT crc, float fLast, float fOpen, WCHAR* szLast, int iPriceUpDown);//绘制行情

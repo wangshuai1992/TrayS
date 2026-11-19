@@ -9,6 +9,7 @@
 #include "framework.h"
 #include "TrayS.h"
 COLORREF oPixelColor;
+int nPixelSkip = 0;//屏幕取色要 DWM 从显卡回读，单次 4~17ms，只每 10 次重绘取一次
 HDC hDesktopDC=NULL;
 int DPI(int pixel)
 {
@@ -21,6 +22,30 @@ COLORREF GetWindowPixel(HWND hWnd)
 	GetWindowRect(hWnd, &rc);
 	COLORREF c = GetPixel(hDesktopDC, rc.left+1, rc.top+=(rc.bottom-rc.top)/2);
 	return c;
+}
+BOOL IsCovered(HWND hWnd)//Z 序在它上面、可见且与它重叠的窗口是否存在
+{
+	RECT rc, r, t;
+	GetWindowRect(hWnd, &rc);
+	for (HWND h = GetWindow(hWnd, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV))
+	{
+		if (!IsWindowVisible(h) || !GetWindowRect(h, &r) || !IntersectRect(&t, &r, &rc))
+			continue;
+		BOOL bCloaked = FALSE;
+		if (pDwmGetWindowAttribute)
+			pDwmGetWindowAttribute(h, 14, &bCloaked, sizeof(BOOL));//DWMWA_CLOAKED
+		if (!bCloaked)
+			return TRUE;
+	}
+	return FALSE;
+}
+void KeepTopmost(HWND hWnd, int x, int y, int cx, int cy)//浮动窗口置顶。位置没变、仍是置顶、也没被挡住时跳过，原来每个刷新周期都调，Win11 上一次要几百微秒
+{
+	RECT rc;
+	GetWindowRect(hWnd, &rc);
+	if (rc.left != x || rc.top != y || rc.right - rc.left != cx || rc.bottom - rc.top != cy || !IsWindowVisible(hWnd) ||
+		!(GetWindowLongPtr(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) || IsCovered(hWnd))
+		SetWindowPos(hWnd, HWND_TOPMOST, x, y, cx, cy, SWP_NOACTIVATE);
 }
 BOOL CALLBACK FindSettingWindowFunc(HWND hWnd, LPARAM lpAram)///////////查找TrayS主窗口防止重复开启
 {
@@ -306,6 +331,8 @@ int GetPDH(BOOL bCPU, BOOL bDisk)
 {
 	if (hPDH == NULL)
 		SwitchPDH(TRUE);
+	if (hPDH == NULL)//pdh.dll 加载或打开查询失败时，函数指针是空的或已随 FreeLibrary 失效
+		return iCPU;
 	if (PdhCollectQueryData(hQuery) == ERROR_SUCCESS)
 	{
 		PDH_FMT_COUNTERVALUE pdhValue;
@@ -446,8 +473,6 @@ void CloseTaskBar()
 		DestroyWindow(hTaskBar);
 	if (IsWindow(hTaskTips))
 		DestroyWindow(hTaskTips);
-	if (IsWindow(hPrice))
-		DestroyWindow(hPrice);
 	if(IsWindow(hTime))
 		DestroyWindow(hTime);	
 }
@@ -505,6 +530,7 @@ void OpenTaskBar()
 					TraySave.cMonitorColor[0] = RGB(0, 0, 1);
 				SetWindowLongPtr(hTaskBar, GWL_EXSTYLE, GetWindowLongPtr(hTaskBar, GWL_EXSTYLE) | WS_EX_LAYERED);
 				SetLayeredWindowAttributes(hTaskBar, GetWindowPixel(hTray), 0, LWA_COLORKEY);
+				nPixelSkip = 0;//新窗口第一次重绘时重新取色，和颜色键保持一致
 
 /*
 					if (bThemeMode)
@@ -596,6 +622,64 @@ int GetCpuTemp(DWORD Core)
 	}
 	return 0;
 }
+//////////////////////////////////////////////////独显是否在休眠(D3)。查 PnP 电源状态不会唤醒显卡，休眠时跳过 NVAPI 读温度
+typedef DWORD(WINAPI* pfnCM_Get_Device_ID_List_SizeW)(PULONG, PCWSTR, ULONG);
+typedef DWORD(WINAPI* pfnCM_Get_Device_ID_ListW)(PCWSTR, PWCHAR, ULONG, ULONG);
+typedef DWORD(WINAPI* pfnCM_Locate_DevNodeW)(PDWORD, PCWSTR, ULONG);
+typedef DWORD(WINAPI* pfnCM_Get_DevNode_PropertyW)(DWORD, const void*, PULONG, PBYTE, PULONG, ULONG);
+struct DEVPROPKEY_T { GUID fmtid; ULONG pid; };
+const DEVPROPKEY_T kDevClassGuid = { {0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}}, 10 };//DEVPKEY_Device_ClassGuid
+const DEVPROPKEY_T kDevPowerData = { {0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}}, 32 };//DEVPKEY_Device_PowerData
+const GUID kDisplayClass = { 0x4d36e968,0xe325,0x11ce,{0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18} };
+pfnCM_Get_DevNode_PropertyW CM_Get_DevNode_PropertyT = NULL;
+DWORD dwNvDevInst = 0;
+BOOL bNvGpuSleeping = FALSE;
+BOOL IsNvidiaPciId(const WCHAR* id)//不依赖 CRT 的前缀比较（Release 版不链接运行库）
+{
+	for (const WCHAR* p = L"PCI\\VEN_10DE"; *p; ++p, ++id)
+		if ((*id | 0x20) != (*p | 0x20))
+			return FALSE;
+	return TRUE;
+}
+void FindNvGpuDevNode()
+{
+	HMODULE hCfg = LoadLibrary(L"cfgmgr32.dll");
+	if (!hCfg)
+		return;
+	pfnCM_Get_Device_ID_List_SizeW pListSize = (pfnCM_Get_Device_ID_List_SizeW)GetProcAddress(hCfg, "CM_Get_Device_ID_List_SizeW");
+	pfnCM_Get_Device_ID_ListW pList = (pfnCM_Get_Device_ID_ListW)GetProcAddress(hCfg, "CM_Get_Device_ID_ListW");
+	pfnCM_Locate_DevNodeW pLocate = (pfnCM_Locate_DevNodeW)GetProcAddress(hCfg, "CM_Locate_DevNodeW");
+	CM_Get_DevNode_PropertyT = (pfnCM_Get_DevNode_PropertyW)GetProcAddress(hCfg, "CM_Get_DevNode_PropertyW");
+	ULONG len = 0;
+	if (!pListSize || !pList || !pLocate || !CM_Get_DevNode_PropertyT || pListSize(&len, L"PCI", 0x101) != 0 || len == 0)//0x101=只列出PCI下存在的设备
+		return;
+	WCHAR* ids = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, len * sizeof(WCHAR));
+	if (ids && pList(L"PCI", ids, len, 0x101) == 0)
+	{
+		for (WCHAR* id = ids; *id; id += lstrlen(id) + 1)
+		{
+			DWORD dn;
+			GUID cls;
+			ULONG type, size = sizeof(cls);
+			if (IsNvidiaPciId(id) && pLocate(&dn, id, 0) == 0 &&
+				CM_Get_DevNode_PropertyT(dn, &kDevClassGuid, &type, (PBYTE)&cls, &size, 0) == 0 && InlineIsEqualGUID(cls, kDisplayClass))
+			{
+				dwNvDevInst = dn;
+				break;
+			}
+		}
+	}
+	HeapFree(GetProcessHeap(), 0, ids);
+}
+BOOL IsNvGpuSleeping()
+{
+	if (!dwNvDevInst)
+		return FALSE;
+	ULONG pd[16], type, size = sizeof(pd);
+	if (CM_Get_DevNode_PropertyT(dwNvDevInst, &kDevPowerData, &type, (PBYTE)pd, &size, 0) != 0)
+		return FALSE;
+	return pd[1] >= 4;//CM_POWER_DATA.PD_MostRecentPowerState >= PowerDeviceD3
+}
 //////////////////////////////////////////////////载入温度DLL
 void LoadTemperatureDLL()
 {
@@ -657,6 +741,7 @@ void LoadTemperatureDLL()
 					}
 					int physicalGpuCount;
 					NvAPI_EnumPhysicalGPUs(hPhysicalGpu, &physicalGpuCount);
+					FindNvGpuDevNode();
 				}
 				else
 				{
@@ -784,7 +869,6 @@ void OpenSetting()
 	CheckDlgButton(hSetting, IDC_CHECK_TEMPERATURE, TraySave.bMonitorTemperature);
 	CheckDlgButton(hSetting, IDC_CHECK_USAGE, TraySave.bMonitorUsage);
 	CheckDlgButton(hSetting, IDC_CHECK_DISK, TraySave.bMonitorDisk);
-	CheckDlgButton(hSetting, IDC_CHECK_PRICE, TraySave.bMonitorPrice);
 	CheckDlgButton(hSetting, IDC_CHECK_SOUND, TraySave.bSound);
 	CheckDlgButton(hSetting, IDC_CHECK_MONITOR_PDH, TraySave.bMonitorPDH);
 	CheckDlgButton(hSetting, IDC_CHECK_MONITOR_SIMPLE, TraySave.iMonitorSimple);
@@ -842,9 +926,7 @@ void OpenSetting()
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_TRAFFIC_HIGH), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_LOW), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
 	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_MEDUIM), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
-	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_HIGH), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);	
-	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_PRICE_LOW), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
-	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_PRICE_HIGH), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
+	oldColorButtonPoroc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hSetting, IDC_BUTTON_COLOR_HIGH), GWLP_WNDPROC, (LONG_PTR)ColorButtonProc);
 	ShowWindow(hSetting, SW_SHOW);
 	UpdateWindow(hSetting);
 	SetForegroundWindow(hSetting);
@@ -930,11 +1012,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 				while (TrayData->bExit == FALSE && iReset != 0)
 				{
 					HANDLE hProcess;
+					DWORD dwStart = GetTickCount();
 					RunProcess(0, 0, &hProcess);
 					EmptyProcessMemory();
 					WaitForSingleObject(hProcess, INFINITE);
 					CloseHandle(hProcess);
-					iReset--;
+					if (GetTickCount() - dwStart > 10000)//正常运行过才退出的（关闭设置窗口也会让工作进程退出）不算失败。原来总共只重启 6 次，用完 TrayS 就消失
+						iReset = 6;
+					else
+						iReset--;//启动后很快就退出才计数，连续 6 次说明起不来，不再重启
 				}
 				UnmapViewOfFile(TrayData);
 				CloseHandle(hMap);
@@ -1070,10 +1156,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 			{
 				pDwmGetWindowAttribute = (pfnDwmGetWindowAttribute)GetProcAddress(hDwmapi, "DwmGetWindowAttribute");
 			}
-			SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+			SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);//原来设成高于正常。计划任务默认用低于正常启动，这里显式设回正常
 			if (TraySave.bMonitorTemperature)
 				LoadTemperatureDLL();
 			pProcessTime = NULL;
+			InitializeCriticalSection(&csProcess);
 			EnableDebugPrivilege(TRUE);
 			SYSTEM_INFO si;
 			GetSystemInfo(&si);
@@ -1115,9 +1202,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 			}
 //			WaitForSingleObject(hThread, INFINITE);
 			TerminateThread(hGetDataThread, 0);
-			TerminateThread(hPriceThread, 0);
 			CloseHandle(hGetDataThread);
-			CloseHandle(hPriceThread);
 //			CloseHandle(hMainThread);
 			if (IsWindow(hSetting))
 				DestroyWindow(hSetting);
@@ -1152,43 +1237,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 		CloseHandle(hMap);
 	ExitProcess((UINT)0);
 }
-DWORD WINAPI GetPriceThreadProc(PVOID pParam)//获取行情线程
-{
-	while (!bRealClose)
-	{
-		DWORD dStart = GetTickCount();
-		if (TraySave.bMonitorPrice)
-		{
-			if (TraySave.iPriceInterface[0] == 0)
-				GetOKXPrice(TraySave.szPriceName1, TraySave.szOKXWeb, &TrayData->fLastPrice1, &TrayData->fOpenPrice1, TrayData->szLastPrice1, NULL);
-			else
-				GetSinaPrice(TraySave.szPriceName1, &TrayData->fLastPrice1, &TrayData->fOpenPrice1, TrayData->szLastPrice1, NULL);
-			TrayData->szLastPrice1[7] = L'\0';
-			if (TraySave.iPriceInterface[1] == 0)
-				GetOKXPrice(TraySave.szPriceName2, TraySave.szOKXWeb, &TrayData->fLastPrice2, &TrayData->fOpenPrice2, TrayData->szLastPrice2, NULL);
-			else
-				GetSinaPrice(TraySave.szPriceName2, &TrayData->fLastPrice2, &TrayData->fOpenPrice2, TrayData->szLastPrice2, NULL);
-			TrayData->szLastPrice2[7] = L'\0';
-			if (TraySave.bTwoFour)
-			{
-				if (TraySave.iPriceInterface[2] == 0)
-					GetOKXPrice(TraySave.szPriceName3, TraySave.szOKXWeb, &TrayData->fLastPrice3, &TrayData->fOpenPrice3, TrayData->szLastPrice3, NULL);
-				else
-					GetSinaPrice(TraySave.szPriceName3, &TrayData->fLastPrice3, &TrayData->fOpenPrice3, TrayData->szLastPrice3, NULL);
-				TrayData->szLastPrice3[7] = L'\0';
-				if (TraySave.iPriceInterface[3] == 0)
-					GetOKXPrice(TraySave.szPriceName4, TraySave.szOKXWeb, &TrayData->fLastPrice4, &TrayData->fOpenPrice4, TrayData->szLastPrice4, NULL);
-				else
-					GetSinaPrice(TraySave.szPriceName4, &TrayData->fLastPrice4, &TrayData->fOpenPrice4, TrayData->szLastPrice4, NULL);
-				TrayData->szLastPrice4[7] = L'\0';
-			}
-		}
-		DWORD dTime = GetTickCount() - dStart;
-		if (dTime < 888)
-			Sleep(888 - dTime);
-	}
-	return 0;
-}
 DWORD dwIPSize = 0;
 DWORD dwMISize = 0;
 int iGetAddressTime = 10;//10秒一次获取网卡信息
@@ -1210,6 +1258,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			{
 				iCPU = GetCPUUseRate();
 			}
+			EnterCriticalSection(&csProcess);
 			if (IsWindow(hTaskTips))
 			{
 				nProcess = GetProcessMemUsage();
@@ -1217,9 +1266,11 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			}
 			else if (pProcessTime != NULL)
 			{
+				nProcessTimeCap = 0;
 				HeapFree(GetProcessHeap(), 0, pProcessTime);
 				pProcessTime = NULL;
 			}
+			LeaveCriticalSection(&csProcess);
 			if (TraySave.bMonitorTemperature)
 			{
 				if (bRing0)
@@ -1232,7 +1283,8 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 				{
 					int iATITemperature = 0;
 					int iNVTemperature = 0;
-					if (hNVDLL)
+					bNvGpuSleeping = hNVDLL && IsNvGpuSleeping();
+					if (hNVDLL && !bNvGpuSleeping)
 					{
 						NV_GPU_THERMAL_SETTINGS currentTemp;//获取温度的数据结构
 						currentTemp.version = NV_GPU_THERMAL_SETTINGS_VER;//一定要设置，不然调用获取温度函数时候会出错
@@ -1259,6 +1311,8 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 						else
 							TrayData->iTemperature2 = iNVTemperature;
 					}
+					else if (bNvGpuSleeping)
+						TrayData->iTemperature2 = 0;//休眠时清零，避免旧温度触发报警
 				}
 			}
 			if (TraySave.bMonitorTraffic)
@@ -1269,11 +1323,9 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 					if (hIphlpapi)
 					{
 						GetAdaptersAddressesT = (pfnGetAdaptersAddresses)GetProcAddress(hIphlpapi, "GetAdaptersAddresses");
-						getIfTable2 = (pfnGetIfTable2)GetProcAddress(hIphlpapi, "GetIfTable2");
-						if (getIfTable2 == NULL)
+						getIfEntry2 = (pfnGetIfEntry2)GetProcAddress(hIphlpapi, "GetIfEntry2");
+						if (getIfEntry2 == NULL)
 							GetIfTableT = (pfnGetIfTable)GetProcAddress(hIphlpapi, "GetIfTable");
-						else
-							freeMibTable = (pfnFreeMibTable)GetProcAddress(hIphlpapi, "FreeMibTable");
 					}
 				}
 				if (hIphlpapi)
@@ -1281,34 +1333,34 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 					PIP_ADAPTER_ADDRESSES paa;
 					if (iGetAddressTime == 10)
 					{
-						//				DWORD odwIPSize = dwIPSize;
-						dwIPSize = 0;
-						if (GetAdaptersAddressesT(AF_INET, 0, 0, piaa, &dwIPSize) == ERROR_BUFFER_OVERFLOW)
+						//复用上次的缓冲区只调一次，不够大才重新分配。原来每次先传 0 长度取大小再调一遍，取大小和完整调用一样慢；也不再每次释放缓冲区，traffic 里的网卡名指针指向这里
+						ULONG ulGaaFlags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+						ULONG ulSize = dwIPSize;
+						ULONG ret = GetAdaptersAddressesT(AF_INET, ulGaaFlags, 0, piaa, &ulSize);
+						if (ret == ERROR_BUFFER_OVERFLOW)
 						{
-							//					if (dwIPSize != odwIPSize)
+							HeapFree(GetProcessHeap(), 0, piaa);
+							piaa = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ulSize);
+							dwIPSize = piaa ? ulSize : 0;
+							ret = piaa ? GetAdaptersAddressesT(AF_INET, ulGaaFlags, 0, piaa, &ulSize) : ERROR_NOT_ENOUGH_MEMORY;
+						}
+						if (ret == ERROR_SUCCESS)
+						{
+							int n = 0;
+							paa = &piaa[0];
+							while (paa)
 							{
-
-								HeapFree(GetProcessHeap(), 0, piaa);
-								int n = 0;
-								piaa = (PIP_ADAPTER_ADDRESSES)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwIPSize);
-								if (GetAdaptersAddressesT(AF_INET, 0, 0, piaa, &dwIPSize) == ERROR_SUCCESS)
+								if (paa->IfType != IF_TYPE_SOFTWARE_LOOPBACK && paa->IfType != IF_TYPE_TUNNEL)
 								{
-									paa = &piaa[0];
-									while (paa)
-									{
-										if (paa->IfType != IF_TYPE_SOFTWARE_LOOPBACK && paa->IfType != IF_TYPE_TUNNEL)
-										{
-											++n;
-										}
-										paa = paa->Next;
-									}
-									if (n != nTraffic)
-									{
-										HeapFree(GetProcessHeap(), 0, traffic);
-										nTraffic = n;
-										traffic = (TRAFFIC*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, nTraffic * sizeof TRAFFIC);
-									}
+									++n;
 								}
+								paa = paa->Next;
+							}
+							if (n != nTraffic)
+							{
+								HeapFree(GetProcessHeap(), 0, traffic);
+								nTraffic = n;
+								traffic = (TRAFFIC*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, nTraffic * sizeof TRAFFIC);
 							}
 						}
 						iGetAddressTime = 0;
@@ -1319,59 +1371,54 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 					{
 						ULONG64 m_in_bytes = 0;
 						ULONG64 m_out_bytes = 0;
-						if (getIfTable2)
+						if (getIfEntry2)//只查需要的网卡。原来用 GetIfTable2 每秒把全部接口（含几十个虚拟/过滤接口）查一遍，xps9520 上一次 3.6ms
 						{
-							getIfTable2(&mit2);
-							for (DWORD i = 0; i < mit2->NumEntries; i++)
+							int l = 0;
+							paa = &piaa[0];
+							while (paa && l < nTraffic)
 							{
-								int l = 0;
-								paa = &piaa[0];
-								while (paa)
+								if (paa->IfType != IF_TYPE_SOFTWARE_LOOPBACK && paa->IfType != IF_TYPE_TUNNEL)
 								{
-									if (paa->IfType != IF_TYPE_SOFTWARE_LOOPBACK && paa->IfType != IF_TYPE_TUNNEL)
+									MIB_IF_ROW2 row;
+									memset(&row, 0, sizeof row);
+									row.InterfaceIndex = paa->IfIndex;
+									if (getIfEntry2(&row) == NO_ERROR)
 									{
-										if (paa->IfIndex == mit2->Table[i].InterfaceIndex)
+										traffic[l].in_byte = (row.InOctets - traffic[l].in_bytes);
+										traffic[l].out_byte = (row.OutOctets - traffic[l].out_bytes);
+										traffic[l].in_bytes = row.InOctets;
+										traffic[l].out_bytes = row.OutOctets;
+										PIP_ADAPTER_UNICAST_ADDRESS pUnicast = paa->FirstUnicastAddress;
+										while (pUnicast)
 										{
-											traffic[l].in_byte = (mit2->Table[i].InOctets - traffic[l].in_bytes);
-											traffic[l].out_byte = (mit2->Table[i].OutOctets - traffic[l].out_bytes);
-											traffic[l].in_bytes = mit2->Table[i].InOctets;
-											traffic[l].out_bytes = mit2->Table[i].OutOctets;
-											PIP_ADAPTER_UNICAST_ADDRESS pUnicast = paa->FirstUnicastAddress;
-											while (pUnicast)
+											if (AF_INET == pUnicast->Address.lpSockaddr->sa_family)// IPV4 地址，使用 IPV4 转换
 											{
-												if (AF_INET == pUnicast->Address.lpSockaddr->sa_family)// IPV4 地址，使用 IPV4 转换
-												{
-													void* pAddr = &((sockaddr_in*)pUnicast->Address.lpSockaddr)->sin_addr;
-													byte* bp = (byte*)pAddr;
-													wsprintf(traffic[l].IP4, L"%d.%d.%d.%d", bp[0], bp[1], bp[2], bp[3]);
-													break;
-												}
-												//											else if (AF_INET6 == pUnicast->Address.lpSockaddr->sa_family)// IPV6 地址，使用 IPV6 转换
-												//												inet_ntop(PF_INET6, &((sockaddr_in6*)pUnicast->Address.lpSockaddr)->sin6_addr, IP, sizeof(IP));
-												pUnicast = pUnicast->Next;
+												void* pAddr = &((sockaddr_in*)pUnicast->Address.lpSockaddr)->sin_addr;
+												byte* bp = (byte*)pAddr;
+												wsprintf(traffic[l].IP4, L"%d.%d.%d.%d", bp[0], bp[1], bp[2], bp[3]);
+												break;
 											}
-											traffic[l].FriendlyName = paa->FriendlyName;
-											traffic[l].AdapterName = paa->AdapterName;
-											if (lstrlen(paa->FriendlyName) > 19)
-											{
-												paa->FriendlyName[16] = L'.';
-												paa->FriendlyName[17] = L'.';
-												paa->FriendlyName[18] = L'.';
-												paa->FriendlyName[19] = L'\0';
-											}
-											if (TraySave.AdpterName[0] == L'\0' || lstrcmpA(paa->AdapterName, TraySave.AdpterName) == 0)
-											{
-												m_in_bytes += mit2->Table[i].InOctets;
-												m_out_bytes += mit2->Table[i].OutOctets;
-											}
-
+											pUnicast = pUnicast->Next;
 										}
-										++l;
+										traffic[l].FriendlyName = paa->FriendlyName;
+										traffic[l].AdapterName = paa->AdapterName;
+										if (lstrlen(paa->FriendlyName) > 19)
+										{
+											paa->FriendlyName[16] = L'.';
+											paa->FriendlyName[17] = L'.';
+											paa->FriendlyName[18] = L'.';
+											paa->FriendlyName[19] = L'\0';
+										}
+										if (TraySave.AdpterName[0] == L'\0' || lstrcmpA(paa->AdapterName, TraySave.AdpterName) == 0)
+										{
+											m_in_bytes += row.InOctets;
+											m_out_bytes += row.OutOctets;
+										}
 									}
-									paa = paa->Next;
+									++l;
 								}
+								paa = paa->Next;
 							}
-							freeMibTable(mit2);
 						}
 						else
 						{
@@ -1470,9 +1517,8 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 				DWORD dm = GetSystemUsesLightTheme();
 				if (dm != bThemeMode)
 				{
-					DestroyWindow(hTime);
-					DestroyWindow(hTaskBar);
 					bThemeMode = dm;
+					PostMessage(hMain, WM_TRAYS_RECREATE, 0, 0);//窗口属于 UI 线程，原来在这里直接 DestroyWindow 会失败
 				}
 
 			}
@@ -1536,7 +1582,6 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	SetTimer(hMain, 11, 6000, NULL);//内存释放
 	SetTimer(hMain, 3000, 3000, NULL);//每三秒重新读取系统窗口
 	hGetDataThread = CreateThread(NULL, 0, GetDataThreadProc, 0, 0, 0);
-	hPriceThread = CreateThread(NULL, 0, GetPriceThreadProc, 0, 0, 0);
 	return TRUE;
 }
 BOOL Find(IAccessible* paccParent, int iRole, IAccessible** paccChild)//查找任务图标UI
@@ -1585,6 +1630,8 @@ BOOL Find(IAccessible* paccParent, int iRole, IAccessible** paccChild)//查找�
 			varChild.lVal = CHILDID_SELF;
 			*paccChild = pChild;
 		}
+		else
+			continue;//原来这里会对空指针调 get_accState
 		VARIANT varState;
 		pChild->get_accState(varChild, &varState);
 		if ((varState.intVal & STATE_SYSTEM_INVISIBLE) == 0)
@@ -1624,67 +1671,71 @@ void SetTaskBarPos(HWND hTaskListWnd, HWND hTrayWnd, HWND hTaskWnd, HWND hReBarW
 	}
 	if (hOleacc == NULL)
 		return;
-	IAccessible* pAcc = NULL;
-	AccessibleObjectFromWindowT(hTaskListWnd, OBJID_WINDOW, IID_IAccessible, (void**)&pAcc);
-	IAccessible* paccChlid = NULL;
-	if (pAcc)
-	{
-		if (Find(pAcc, 22, &paccChlid) == FALSE)
-		{
-			return;
-		}
-	}
-	else
-		return;
-	long childCount;
-	long returnCount;
-	LONG left, top, width, height;
-	LONG ol = 0, ot = 0;
 	int tWidth = 0;
 	int tHeight = 0;
-	if (paccChlid)
+	if (TraySave.iPos != 0 || TraySave.bNear)//图标靠左且不贴近图标时用不到图标宽度，省掉每秒一遍跨进程的 MSAA 遍历
 	{
-		if (paccChlid->get_accChildCount(&childCount) == S_OK && childCount != 0)
+		IAccessible* pAcc = NULL;
+		AccessibleObjectFromWindowT(hTaskListWnd, OBJID_WINDOW, IID_IAccessible, (void**)&pAcc);
+		IAccessible* paccChlid = NULL;
+		if (pAcc)
 		{
-			VARIANT* pArray = (VARIANT*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof VARIANT * childCount);
-			if (AccessibleChildrenT(paccChlid, 0L, childCount, pArray, &returnCount) == S_OK)
+			if (Find(pAcc, 22, &paccChlid) == FALSE)//Find 只在找到时释放 pAcc
 			{
-				for (int x = 0; x < returnCount; x++)
+				pAcc->Release();
+				return;
+			}
+		}
+		else
+			return;
+		long childCount;
+		long returnCount;
+		LONG left, top, width, height;
+		LONG ol = 0, ot = 0;
+		if (paccChlid)
+		{
+			if (paccChlid->get_accChildCount(&childCount) == S_OK && childCount != 0)
+			{
+				VARIANT* pArray = (VARIANT*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof VARIANT * childCount);
+				if (AccessibleChildrenT(paccChlid, 0L, childCount, pArray, &returnCount) == S_OK)
 				{
-					VARIANT vtChild = pArray[x];
+					for (int x = 0; x < returnCount; x++)
 					{
-
-						VARIANT varState;
-						paccChlid->get_accState(vtChild, &varState);
-						if ((varState.intVal & STATE_SYSTEM_INVISIBLE) == 0)
+						VARIANT vtChild = pArray[x];
 						{
-							VARIANT varRole;
-							paccChlid->get_accRole(vtChild, &varRole);
-							if (varRole.intVal == 0x2b || varRole.intVal == 0x39)
+
+							VARIANT varState;
+							paccChlid->get_accState(vtChild, &varState);
+							if ((varState.intVal & STATE_SYSTEM_INVISIBLE) == 0)
 							{
-								paccChlid->accLocation(&left, &top, &width, &height, vtChild);
-								if (ol != left)
+								VARIANT varRole;
+								paccChlid->get_accRole(vtChild, &varRole);
+								if (varRole.intVal == 0x2b || varRole.intVal == 0x39)
 								{
-									tWidth += width;
-									ol = left;
-								}
-								if (ot != top)
-								{
-									tHeight += height;
-									ot = top;
+									paccChlid->accLocation(&left, &top, &width, &height, vtChild);
+									if (ol != left)
+									{
+										tWidth += width;
+										ol = left;
+									}
+									if (ot != top)
+									{
+										tHeight += height;
+										ot = top;
+									}
 								}
 							}
 						}
 					}
 				}
+				HeapFree(GetProcessHeap(), 0, pArray);
 			}
-			HeapFree(GetProcessHeap(), 0, pArray);
+			paccChlid->Release();
 		}
-		paccChlid->Release();
+		else
+			return;
+		iIconsWidth = tWidth;
 	}
-	else
-		return;
-	iIconsWidth = tWidth;
 	RECT lrc, src, trc;
 	GetWindowRect(hTaskListWnd, &lrc);
 	GetWindowRect(hTrayWnd, &src);
@@ -1933,24 +1984,6 @@ void SetWH()
 	}
 	else
 		wTime = 0;
-	if (TraySave.bMonitorPrice)
-	{
-		::GetTextExtentPoint(mdc, L"99999.8 8.88%", lstrlen(L"99999.8 8.88%"), &tSize);
-		wPrice = tSize.cx + wSpace;
-		if (TraySave.bTwoFour)
-		{
-			if (TraySave.bMonitorFloatVRow && TraySave.bMonitorFloat)
-			{
-			}
-			else
-				wPrice += wPrice;
-			mHeight += wHeight * 2;
-		}
-		mWidth += wPrice;
-		mHeight += wHeight * 2;
-	}
-	else
-		wPrice = 0;
 //	mWidth += 4;
 //	mHeight += 4;
 	SelectObject(mdc, oldFont);
@@ -1998,13 +2031,11 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				iWidth = wDisk;
 			if (wUsage > iWidth)
 				iWidth = wUsage;
-			if (wPrice > iWidth)
-				iWidth = wPrice;
 			if (TraySave.dMonitorPoint.x + iWidth > ScreenRect.right)
 				TraySave.dMonitorPoint.x = ScreenRect.right - iWidth;
 			if (TraySave.dMonitorPoint.y + mHeight + 8 > ScreenRect.bottom)
 				TraySave.dMonitorPoint.y = ScreenRect.bottom - mHeight - 8;
-			SetWindowPos(hTaskBar, HWND_TOPMOST, TraySave.dMonitorPoint.x, TraySave.dMonitorPoint.y, iWidth, mHeight, SWP_NOACTIVATE);
+			KeepTopmost(hTaskBar, TraySave.dMonitorPoint.x, TraySave.dMonitorPoint.y, iWidth, mHeight);
 			VTray = TRUE;
 		}
 		else
@@ -2013,7 +2044,7 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				TraySave.dMonitorPoint.x = ScreenRect.right - mWidth;
 			if (TraySave.dMonitorPoint.y + wHeight * 2 > ScreenRect.bottom)
 				TraySave.dMonitorPoint.y = ScreenRect.bottom - wHeight * 2;
-			SetWindowPos(hTaskBar, HWND_TOPMOST, TraySave.dMonitorPoint.x, TraySave.dMonitorPoint.y, mWidth, wHeight * 2, SWP_NOACTIVATE);
+			KeepTopmost(hTaskBar, TraySave.dMonitorPoint.x, TraySave.dMonitorPoint.y, mWidth, wHeight * 2);
 			VTray = FALSE;
 		}		
 	}
@@ -2145,7 +2176,7 @@ void AdjustWindowPos()//设置信息窗口位置大小
 			}
 			//		else if(hWin11UI)
 			//			SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW);
-			if(bFullScreen)
+			if (bFullScreen && (!IsWindowVisible(hTaskBar) || !(GetWindowLongPtr(hTaskBar, GWL_EXSTYLE) & WS_EX_TOPMOST) || IsCovered(hTaskBar)))//同浮动窗口，没被挡住就不必每个周期都置顶
 				SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW);
 		}
 		else
@@ -2787,8 +2818,8 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 				rc.right = crc.right;
 				rc.left = crc.right * 92 / 100;
 				DrawText(mdc, sexit, lstrlen(sexit), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+				SelectObject(mdc, oldFont);//先选回旧字体再删除，否则字体还选在 DC 里删不掉，每次重绘泄漏一个
 				DeleteObject(hTipsFont);
-				SelectObject(mdc, oldFont);
 			}
 			GetClientRect(hDlg, &rc);
 			BitBlt(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mdc, 0, 0, SRCCOPY);
@@ -2819,6 +2850,10 @@ void GetProcessCpuUsage()//获取进程CPU占用前五
 		pcu[4].fCpuUsage = 0;
 		pcu[5].fCpuUsage = 0;
 	}
+	PROCESSTIME* pProcessTime = ::pProcessTime;//取本地副本，数据线程和界面线程都会调用这里
+	int nCap = nProcessTimeCap;
+	if (pProcessTime == NULL)
+		return;
 	DWORD dCurID = GetCurrentProcessId();
 	PROCESSENTRY32 pe;
 	pe.dwSize = sizeof(PROCESSENTRY32);
@@ -2834,7 +2869,7 @@ void GetProcessCpuUsage()//获取进程CPU占用前五
 				if (hProc)
 				{
 					int n = -1;
-					for (int i = 0; i < nProcess + 31; i++)
+					for (int i = 0; i < nCap; i++)//原来按当前进程数 +31 遍历，进程变多时会越界
 					{
 						if (pProcessTime[i].dwProcessID == pe.th32ProcessID)
 						{
@@ -2845,7 +2880,7 @@ void GetProcessCpuUsage()//获取进程CPU占用前五
 							n = i;
 					}
 					FILETIME CreateTime, ExitTime, KernelTime, UserTime;
-					if (GetProcessTimes(hProc, &CreateTime, &ExitTime, &KernelTime, &UserTime))
+					if (n != -1 && GetProcessTimes(hProc, &CreateTime, &ExitTime, &KernelTime, &UserTime))//没有空位时跳过，原来会写 pProcessTime[-1]
 					{
 						float nProcCpuPercent = 0;
 						BOOL bRetCode = FALSE;
@@ -3327,7 +3362,7 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		break;
 	case WM_MOUSEMOVE:
-		if (bEvent == FALSE && (TraySave.bMonitorTips||TraySave.bMonitorPrice))
+		if (bEvent == FALSE && TraySave.bMonitorTips)
 		{
 			SetTrackMouseEvent(hTaskBar, TME_LEAVE | TME_HOVER);
 			bEvent = TRUE;
@@ -3335,56 +3370,27 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		break;
 	case WM_MOUSEHOVER:
 	{
-		POINT pt;
-		RECT rc;
-		GetCursorPos(&pt);
-		GetWindowRect(hTaskBar,&rc);
-		BOOL bV = FALSE;
-		if (rc.bottom - rc.top > rc.right - rc.left)
-			bV = TRUE;
-		if (TraySave.bMonitorPrice&&((pt.x > rc.right - wPrice&&!bV)||(pt.y>rc.bottom-wHeight*2-(TraySave.bTwoFour*wHeight*2) && bV)))
-		{
-			if (IsWindow(hTaskTips))
-			{
-				if (pProcessTime != NULL)
-				{
-					HeapFree(GetProcessHeap(), 0, pProcessTime);
-					pProcessTime = NULL;
-				}
-				DestroyWindow(hTaskTips);
-			}
-			if (!IsWindow(hPrice))
-			{
-				hPrice = ::CreateDialog(hInst, MAKEINTRESOURCE(IDD_PRICE), NULL, (DLGPROC)PriceProc);
-				if (TraySave.bTwoFour)
-				{
-					RECT rc;
-					GetWindowRect(hPrice, &rc);
-					SetWindowPos(hPrice, HWND_TOPMOST, 0, 0, (rc.right - rc.left) * 2, rc.bottom - rc.top, SWP_NOMOVE);
-				}
-				SendMessage(hPrice, WM_COMMAND, IDC_TWOFOUR, 888);
-			}
-		}
-		else if (!IsWindowVisible(hTaskTips)&&TraySave.bMonitorTips)
+		if (!IsWindowVisible(hTaskTips)&&TraySave.bMonitorTips)
 		{
 /*
 			if (s_in_byte == 0)
 				return FALSE;
-*/			
-			if (IsWindow(hPrice))
-				DestroyWindow(hPrice);
+*/
 			if (!IsWindow(hTaskTips))
 			{
 				hTaskTips = ::CreateDialog(hInst, MAKEINTRESOURCE(IDD_TIPS), NULL, (DLGPROC)TaskTipsProc);
 				SetLayeredWindowAttributes(hTaskTips, 0, 255, LWA_ALPHA);
 			}
+			EnterCriticalSection(&csProcess);
 			nProcess = GetProcessMemUsage();
 			if (pProcessTime == NULL)
 			{
 				pProcessTime = (PROCESSTIME*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof PROCESSTIME * (nProcess + 32));
+				nProcessTimeCap = pProcessTime ? nProcess + 32 : 0;
 //				memset(pProcessTime, 0, sizeof(PROCESSTIME) * (nProcess + 32));
 			}
 			GetProcessCpuUsage();
+			LeaveCriticalSection(&csProcess);
 			HDC mdc = GetDC(hMain);
 			TraySave.TipsFont.lfHeight = DPI(TraySave.TipsFontSize);
 			HFONT hTipsFont = CreateFontIndirect(&TraySave.TipsFont); //创建字体
@@ -3552,86 +3558,6 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			}
 			if (IsWindow(hTaskBar))
 				::InvalidateRect(hTaskBar, NULL, TRUE);
-			if (TraySave.bMonitorPrice)
-			{
-				TrayData->iPriceUpDown[0] = 0;
-				TrayData->iPriceUpDown[1] = 0;
-				if (TrayData->fLastPrice1 != 0)
-				{
-
-					if (TraySave.HighRemind[0] != 0 && TraySave.HighRemind[0] < TrayData->fLastPrice1 && TraySave.bCheckHighRemind[0])
-						TrayData->iPriceUpDown[0] = MB_ICONHAND;
-					if (TraySave.HighRemind[1]!=0&&TraySave.HighRemind[1] < TrayData->fLastPrice1 && TraySave.bCheckHighRemind[1])
-						TrayData->iPriceUpDown[0] = MB_ICONHAND;
-					if (TraySave.HighRemind[2] != 0 && TraySave.HighRemind[2] < TrayData->fLastPrice1 && TraySave.bCheckHighRemind[2])
-						TrayData->iPriceUpDown[0] = MB_ICONHAND;
-					if (TraySave.LowRemind[0] != 0 && TraySave.LowRemind[0] > TrayData->fLastPrice1 && TraySave.bCheckLowRemind[0])
-						TrayData->iPriceUpDown[0] = MB_ICONWARNING;
-					if (TraySave.LowRemind[1] != 0 && TraySave.LowRemind[1] > TrayData->fLastPrice1 && TraySave.bCheckLowRemind[1])
-						TrayData->iPriceUpDown[0] = MB_ICONWARNING;
-					if (TraySave.LowRemind[2] != 0 && TraySave.LowRemind[2] > TrayData->fLastPrice1 && TraySave.bCheckLowRemind[2])
-						TrayData->iPriceUpDown[0] = MB_ICONWARNING;
-					if (TrayData->iPriceUpDown[0] != 0)
-						MessageBeep(TrayData->iPriceUpDown[0]);
-				}
-				if (TrayData->fLastPrice2 != 0)
-				{
-					if (TraySave.HighRemind[3]!=0&&TraySave.HighRemind[3] < TrayData->fLastPrice2 && TraySave.bCheckHighRemind[3])
-						TrayData->iPriceUpDown[1] = MB_ICONHAND;
-					if (TraySave.HighRemind[4] != 0 && TraySave.HighRemind[4] < TrayData->fLastPrice2 && TraySave.bCheckHighRemind[4])
-						TrayData->iPriceUpDown[1] = MB_ICONHAND;
-					if (TraySave.HighRemind[5] != 0 && TraySave.HighRemind[5] < TrayData->fLastPrice2 && TraySave.bCheckHighRemind[5])
-						TrayData->iPriceUpDown[1] = MB_ICONHAND;
-					if (TraySave.LowRemind[3]!=0&&TraySave.LowRemind[3] > TrayData->fLastPrice2 && TraySave.bCheckLowRemind[3])
-						TrayData->iPriceUpDown[1] = MB_ICONWARNING;
-					if (TraySave.LowRemind[4] != 0 && TraySave.LowRemind[4] > TrayData->fLastPrice2 && TraySave.bCheckLowRemind[4])
-						TrayData->iPriceUpDown[1] = MB_ICONWARNING;
-					if (TraySave.LowRemind[5] != 0 && TraySave.LowRemind[5] > TrayData->fLastPrice2 && TraySave.bCheckLowRemind[5])
-						TrayData->iPriceUpDown[1] = MB_ICONWARNING;
-					if (TrayData->iPriceUpDown[1] != 0)
-						MessageBeep(TrayData->iPriceUpDown[1]);
-				}
-				if (TraySave.bTwoFour)
-				{
-					TrayData->iPriceUpDown[2] = 0;
-					TrayData->iPriceUpDown[3] = 0;
-					if (TrayData->fLastPrice3 != 0)
-					{
-
-						if (TraySave.HighRemind[6] != 0 && TraySave.HighRemind[6] < TrayData->fLastPrice3 && TraySave.bCheckHighRemind[6])
-							TrayData->iPriceUpDown[2] = MB_ICONHAND;
-						if (TraySave.HighRemind[7] != 0 && TraySave.HighRemind[7] < TrayData->fLastPrice3 && TraySave.bCheckHighRemind[7])
-							TrayData->iPriceUpDown[2] = MB_ICONHAND;
-						if (TraySave.HighRemind[8] != 0 && TraySave.HighRemind[8] < TrayData->fLastPrice3 && TraySave.bCheckHighRemind[8])
-							TrayData->iPriceUpDown[2] = MB_ICONHAND;
-						if (TraySave.LowRemind[6] != 0 && TraySave.LowRemind[6] > TrayData->fLastPrice3 && TraySave.bCheckLowRemind[6])
-							TrayData->iPriceUpDown[2] = MB_ICONWARNING;
-						if (TraySave.LowRemind[7] != 0 && TraySave.LowRemind[7] > TrayData->fLastPrice3 && TraySave.bCheckLowRemind[7])
-							TrayData->iPriceUpDown[2] = MB_ICONWARNING;
-						if (TraySave.LowRemind[8] != 0 && TraySave.LowRemind[8] > TrayData->fLastPrice3 && TraySave.bCheckLowRemind[8])
-							TrayData->iPriceUpDown[2] = MB_ICONWARNING;
-						if (TrayData->iPriceUpDown[2] != 0)
-							MessageBeep(TrayData->iPriceUpDown[2]);
-					}
-					if (TrayData->fLastPrice4 != 0)
-					{
-						if (TraySave.HighRemind[9] != 0 && TraySave.HighRemind[9] < TrayData->fLastPrice4 && TraySave.bCheckHighRemind[9])
-							TrayData->iPriceUpDown[3] = MB_ICONHAND;
-						if (TraySave.HighRemind[10] != 0 && TraySave.HighRemind[10] < TrayData->fLastPrice4 && TraySave.bCheckHighRemind[10])
-							TrayData->iPriceUpDown[3] = MB_ICONHAND;
-						if (TraySave.HighRemind[11] != 0 && TraySave.HighRemind[11] < TrayData->fLastPrice4 && TraySave.bCheckHighRemind[11])
-							TrayData->iPriceUpDown[3] = MB_ICONHAND;
-						if (TraySave.LowRemind[9] != 0 && TraySave.LowRemind[9] > TrayData->fLastPrice4 && TraySave.bCheckLowRemind[9])
-							TrayData->iPriceUpDown[3] = MB_ICONWARNING;
-						if (TraySave.LowRemind[10] != 0 && TraySave.LowRemind[10] > TrayData->fLastPrice4 && TraySave.bCheckLowRemind[10])
-							TrayData->iPriceUpDown[3] = MB_ICONWARNING;
-						if (TraySave.LowRemind[11] != 0 && TraySave.LowRemind[11] > TrayData->fLastPrice4 && TraySave.bCheckLowRemind[11])
-							TrayData->iPriceUpDown[3] = MB_ICONWARNING;
-						if (TrayData->iPriceUpDown[3] != 0)
-							MessageBeep(TrayData->iPriceUpDown[3]);
-					}
-				}
-			}
 			if (TraySave.bSound)
 			{
 				if (TraySave.bMonitorTraffic)
@@ -3658,7 +3584,7 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 					if (!bFullScreen)
 					{
 
-						if (!KEYDOWN(VK_LBUTTON) && !IsWindow(hTaskTips) && !IsWindow(hPrice))
+						if (!KEYDOWN(VK_LBUTTON) && !IsWindow(hTaskTips))
 						{
 							SendMessage(hTaskBar, WM_MOUSEHOVER, 0, 0);
 						}
@@ -3677,16 +3603,8 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 					}
 				}
 			}
-			if (TraySave.bMonitorPrice)
-			{
-				if (IsWindow(hPrice))
-				{
-					GetWindowRect(hPrice, &brc);
-					if (!PtInRect(&brc, pt))
-						DestroyWindow(hPrice);
-				}
-			}
 		}
+		break;//原来缺 break，会把定时器编号当 HDC 落到 WM_ERASEBKGND
 	case WM_ERASEBKGND:
 	{
 		//		PAINTSTRUCT ps;
@@ -3713,11 +3631,15 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 					*/
 					if ((rovi.dwBuildNumber > 25000||!TraySave.bTrayStyle)&&!TraySave.bMonitorFloat)
 					{
-						COLORREF cPixel = GetWindowPixel(hTray);
-						if (cPixel != oPixelColor)
+						if (--nPixelSkip < 0)
 						{
-							oPixelColor = cPixel;
-							SetLayeredWindowAttributes(hTaskBar, cPixel, 0, LWA_COLORKEY);
+							nPixelSkip = 9;
+							COLORREF cPixel = GetWindowPixel(hTray);
+							if (cPixel != oPixelColor)
+							{
+								oPixelColor = cPixel;
+								SetLayeredWindowAttributes(hTaskBar, cPixel, 0, LWA_COLORKEY);
+							}
 						}
 						hb = CreateSolidBrush(oPixelColor);
 					}
@@ -3938,6 +3860,11 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 							wsprintf(sz, L"%.2d℃", TrayData->iTemperature2);
 						else
 							wsprintf(sz, L"%.2d", TrayData->iTemperature2);
+						if (bNvGpuSleeping)//独显休眠，数字换成 --
+						{
+							sz[0] = L'-';
+							sz[1] = L'-';
+						}
 					}
 					DrawShadowText(mdc, sz, lstrlen(sz), &crc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, bColor, bShadow);
 
@@ -4126,62 +4053,6 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 				else
 					DrawShadowText(mdc, sz, sLen, &crc, DT_CENTER | DT_VCENTER | DT_SINGLELINE, bColor, bShadow);
 				}
-				if (TraySave.bMonitorPrice)
-				{
-					RECT crc = rc;
-					if (VTray)
-					{
-						if (TraySave.bMonitorTraffic)
-							crc.top = wHeight * 2;
-						if (TraySave.bMonitorTemperature)
-						{
-							crc.top += wHeight;
-							if (bRing0)
-								crc.top += wHeight;
-						}
-						if (TraySave.bMonitorUsage)
-							crc.top += wHeight * 2;
-						if (TraySave.bMonitorDisk)
-						{
-							if (hOHMA && TraySave.bMonitorTemperature)
-								crc.top += wHeight * 2;
-							crc.top += wHeight * 2;
-						}
-						if(TraySave.bMonitorTime)
-							crc.top += wHeight * 2;
-						crc.bottom = crc.top + wHeight;
-					}
-					else
-					{
-						crc.left = crc.left + wTraffic + wTemperature + wUsage + wDisk + wTime;
-						crc.right = crc.left + wPrice;						
-						crc.bottom /= 2;
-						if (TraySave.bTwoFour)
-						{
-							crc.right -= wPrice / 2;
-						}
-						InflateRect(&crc, -(wSpace / 2), 0);
-					}
-					DrawPrice(mdc, &crc, TrayData->fLastPrice1, TrayData->fOpenPrice1, TrayData->szLastPrice1, TrayData->iPriceUpDown[0]);
-					if (VTray)
-						OffsetRect(&crc, 0, wHeight);
-					else
-						OffsetRect(&crc, 0, crc.bottom);
-					DrawPrice(mdc, &crc, TrayData->fLastPrice2, TrayData->fOpenPrice2, TrayData->szLastPrice2, TrayData->iPriceUpDown[1]);
-					if (TraySave.bTwoFour)
-					{
-						if (VTray)
-							OffsetRect(&crc, 0, wHeight);
-						else
-							OffsetRect(&crc, wPrice/2, -(crc.bottom-crc.top));
-						DrawPrice(mdc, &crc, TrayData->fLastPrice3, TrayData->fOpenPrice3, TrayData->szLastPrice3, TrayData->iPriceUpDown[2]);
-						if (VTray)
-							OffsetRect(&crc, 0, wHeight);
-						else
-							OffsetRect(&crc, 0, crc.bottom);
-						DrawPrice(mdc, &crc, TrayData->fLastPrice4, TrayData->fOpenPrice4, TrayData->szLastPrice4, TrayData->iPriceUpDown[3]);
-					}
-				}
 				SelectObject(mdc, oldFont);
 			}
 			//		GetClientRect(hDlg, &rc);
@@ -4231,56 +4102,6 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 	}
 	return FALSE;
 }
-void DrawPrice(HDC mdc,LPRECT crc,float fLast,float fOpen,WCHAR *szLast,int iPriceUpDown)
-{
-	WCHAR sz[64];
-	int iLast = (int)(fLast * 100);
-	int pf;
-	float f = (fLast / fOpen) - 1;
-	if (f >= 10)
-	{
-		pf = (int)(f * 100);
-		wsprintf(sz, L"%2d%%", pf);
-	}
-	else if (f < 0)
-	{
-		f = -f;
-		SetTextColor(mdc, TraySave.cPriceColor[0]);
-	}
-	else
-	{
-		SetTextColor(mdc, TraySave.cPriceColor[1]);
-	}
-	if (f >= 1)
-	{
-		pf = (int)(f * 100);
-		wsprintf(sz, L"%2d%%", pf);
-	}
-	else if (f >= 0.1)
-	{
-		pf = (int)(f * 1000);
-		wsprintf(sz, L"%2d.%.1d%%", pf / 10, pf % 10);
-	}
-	else
-	{
-		if (fLast == 0)
-			pf = 10000;
-		else
-			pf = (int)(f * 10000);
-		wsprintf(sz, L"%2d.%.2d%%", pf / 100, pf % 100);
-	}
-	int sLen = lstrlen(sz);
-	DrawShadowText(mdc, sz, sLen, crc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, bColor, bShadow);
-	if (iPriceUpDown != 0)
-	{
-		if (iPriceUpDown == MB_ICONHAND)
-			SetTextColor(mdc, TraySave.cPriceColor[3]);
-		else
-			SetTextColor(mdc, TraySave.cPriceColor[2]);
-	}
-	DrawShadowText(mdc, szLast, lstrlen(szLast), crc, DT_LEFT | DT_VCENTER | DT_SINGLELINE, bColor, bShadow);
-
-}
 INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)//主窗口过程
 {
 	UNREFERENCED_PARAMETER(lParam);
@@ -4325,6 +4146,10 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_TRAYS:
 		if(bSetting)
 			OpenSetting();
+		break;
+	case WM_TRAYS_RECREATE:
+		DestroyWindow(hTime);
+		DestroyWindow(hTaskBar);
 		break;
 	case 0x02e0://WM_DPICHANGED:
 	{
@@ -4432,8 +4257,8 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 //						SetWindowCompositionAttribute(hTray11, TraySave.aMode[iWindowMode], TraySave.dAlphaColor[iWindowMode]);
 					}
 					LONG_PTR exStyle = GetWindowLongPtr(hTray, GWL_EXSTYLE);
-					exStyle |= WS_EX_LAYERED;
-					SetWindowLongPtr(hTray, GWL_EXSTYLE, exStyle);
+					if (!(exStyle & WS_EX_LAYERED))//样式没变也会同步给 explorer 发 WM_STYLECHANGING/CHANGED，每次约 0.2~0.4ms
+						SetWindowLongPtr(hTray, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
 					SetLayeredWindowAttributes(hTray, 0, (BYTE)TraySave.bAlpha[iWindowMode], LWA_ALPHA);
 				}
 				HWND hSecondaryTray = FindWindow(szSecondaryTray, NULL);
@@ -4451,8 +4276,8 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 					if (TraySave.aMode[iWindowMode] != ACCENT_DISABLED || oldWindowMode != iWindowMode)
 						SetWindowCompositionAttribute(hSecondaryTray, TraySave.aMode[iWindowMode], TraySave.dAlphaColor[iWindowMode], (BOOL)hWin11UI);
 					LONG_PTR exStyle = GetWindowLongPtr(hSecondaryTray, GWL_EXSTYLE);
-					exStyle |= WS_EX_LAYERED;
-					SetWindowLongPtr(hSecondaryTray, GWL_EXSTYLE, exStyle);
+					if (!(exStyle & WS_EX_LAYERED))
+						SetWindowLongPtr(hSecondaryTray, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
 					SetLayeredWindowAttributes(hSecondaryTray, 0, (BYTE)TraySave.bAlpha[iWindowMode], LWA_ALPHA);
 					hSecondaryTray = FindWindowEx(NULL, hSecondaryTray, szSecondaryTray, NULL);
 				}
@@ -4733,13 +4558,6 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			SetWH();
 			AdjustWindowPos();
 		}
-		else if (LOWORD(wParam) == IDC_CHECK_PRICE)
-		{
-			TraySave.bMonitorPrice = IsDlgButtonChecked(hDlg, IDC_CHECK_PRICE);			
-			WriteReg();
-			SetWH();
-			AdjustWindowPos();
-		}
 		else if (LOWORD(wParam) == IDC_CHECK_MONITOR_PDH)
 		{
 			TraySave.bMonitorPDH = IsDlgButtonChecked(hDlg, IDC_CHECK_MONITOR_PDH);
@@ -4901,7 +4719,7 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 				FreeLibrary(hComdlg32);
 			}
 		}
-		else if (LOWORD(wParam) == IDC_BUTTON_COLOR || (LOWORD(wParam) >= IDC_BUTTON_COLOR_BACKGROUND && LOWORD(wParam) <= IDC_BUTTON_COLOR_PRICE_HIGH))
+		else if (LOWORD(wParam) == IDC_BUTTON_COLOR || (LOWORD(wParam) >= IDC_BUTTON_COLOR_BACKGROUND && LOWORD(wParam) <= IDC_BUTTON_COLOR_HIGH))
 		{
 			CHOOSECOLOR stChooseColor;
 			stChooseColor.lStructSize = sizeof(CHOOSECOLOR);
@@ -4913,16 +4731,8 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			}
 			else
 			{
-				if (LOWORD(wParam) == IDC_BUTTON_COLOR_PRICE_HIGH || LOWORD(wParam) == IDC_BUTTON_COLOR_PRICE_LOW)
-				{
-					stChooseColor.rgbResult = TraySave.cPriceColor[LOWORD(wParam) - IDC_BUTTON_COLOR_PRICE_LOW];
-					stChooseColor.lpCustColors = TraySave.cPriceColor;
-				}
-				else
-				{
-					stChooseColor.rgbResult = TraySave.cMonitorColor[LOWORD(wParam) - IDC_BUTTON_COLOR_BACKGROUND];
-					stChooseColor.lpCustColors = TraySave.cMonitorColor;
-				}
+				stChooseColor.rgbResult = TraySave.cMonitorColor[LOWORD(wParam) - IDC_BUTTON_COLOR_BACKGROUND];
+				stChooseColor.lpCustColors = TraySave.cMonitorColor;
 			}
 			stChooseColor.Flags = CC_RGBINIT | CC_FULLOPEN;
 			stChooseColor.lCustData = 0;
@@ -4946,10 +4756,7 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 						}
 						else
 						{
-							if (LOWORD(wParam) == IDC_BUTTON_COLOR_PRICE_HIGH || LOWORD(wParam) == IDC_BUTTON_COLOR_PRICE_LOW)
-								TraySave.cPriceColor[LOWORD(wParam - IDC_BUTTON_COLOR_PRICE_LOW)] = stChooseColor.rgbResult;
-							else
-								TraySave.cMonitorColor[LOWORD(wParam - IDC_BUTTON_COLOR_BACKGROUND)] = stChooseColor.rgbResult;
+							TraySave.cMonitorColor[LOWORD(wParam - IDC_BUTTON_COLOR_BACKGROUND)] = stChooseColor.rgbResult;
 							if (TraySave.cMonitorColor[0] == 0 || TraySave.cMonitorColor[0] == RGB(0, 0, 1))
 							{
 								TraySave.cMonitorColor[0] = RGB(0, 0, 1);
@@ -4988,13 +4795,8 @@ INT_PTR CALLBACK ColorButtonProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 		GetClientRect(hWnd, &rc);
 		HBRUSH hb;
 		int id = GetDlgCtrlID(hWnd);
-		if (id >= IDC_BUTTON_COLOR_BACKGROUND && id <= IDC_BUTTON_COLOR_PRICE_HIGH)
-		{
-			if(id>=IDC_BUTTON_COLOR_PRICE_LOW)
-				hb = CreateSolidBrush(TraySave.cPriceColor[id - IDC_BUTTON_COLOR_PRICE_LOW]);
-			else
-				hb = CreateSolidBrush(TraySave.cMonitorColor[id - IDC_BUTTON_COLOR_BACKGROUND]);
-		}
+		if (id >= IDC_BUTTON_COLOR_BACKGROUND && id <= IDC_BUTTON_COLOR_HIGH)
+			hb = CreateSolidBrush(TraySave.cMonitorColor[id - IDC_BUTTON_COLOR_BACKGROUND]);
 		else
 			hb = CreateSolidBrush(TraySave.dAlphaColor[iProject] & 0xffffff);
 		FillRect(hdc, &rc, hb);
@@ -5012,233 +4814,6 @@ INT_PTR CALLBACK ColorButtonProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 	}
 	}
 	return CallWindowProc(oldColorButtonPoroc, hWnd, message, wParam, lParam);
-}
-INT_PTR CALLBACK PriceProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
-{
-	switch (message)
-	{
-	case WM_INITDIALOG:
-	{
-		CheckDlgButton(hDlg, IDC_CHECK1, TraySave.bCheckHighRemind[0]);
-		CheckDlgButton(hDlg, IDC_CHECK2, TraySave.bCheckHighRemind[1]);
-		CheckDlgButton(hDlg, IDC_CHECK3, TraySave.bCheckHighRemind[2]);
-		CheckDlgButton(hDlg, IDC_CHECK4, TraySave.bCheckHighRemind[3]);
-		CheckDlgButton(hDlg, IDC_CHECK5, TraySave.bCheckHighRemind[4]);
-		CheckDlgButton(hDlg, IDC_CHECK6, TraySave.bCheckHighRemind[5]);
-		CheckDlgButton(hDlg, IDC_CHECK7, TraySave.bCheckLowRemind[0]);
-		CheckDlgButton(hDlg, IDC_CHECK8, TraySave.bCheckLowRemind[1]);
-		CheckDlgButton(hDlg, IDC_CHECK9, TraySave.bCheckLowRemind[2]);
-		CheckDlgButton(hDlg, IDC_CHECK10, TraySave.bCheckLowRemind[3]);
-		CheckDlgButton(hDlg, IDC_CHECK11, TraySave.bCheckLowRemind[4]);
-		CheckDlgButton(hDlg, IDC_CHECK12, TraySave.bCheckLowRemind[5]);
-		CheckDlgButton(hDlg, IDC_CHECK_13, TraySave.bCheckHighRemind[6]);
-		CheckDlgButton(hDlg, IDC_CHECK_14, TraySave.bCheckHighRemind[7]);
-		CheckDlgButton(hDlg, IDC_CHECK_15, TraySave.bCheckHighRemind[8]);
-		CheckDlgButton(hDlg, IDC_CHECK_16, TraySave.bCheckHighRemind[9]);
-		CheckDlgButton(hDlg, IDC_CHECK_17, TraySave.bCheckHighRemind[10]);
-		CheckDlgButton(hDlg, IDC_CHECK_18, TraySave.bCheckHighRemind[11]);
-		CheckDlgButton(hDlg, IDC_CHECK_19, TraySave.bCheckLowRemind[6]);
-		CheckDlgButton(hDlg, IDC_CHECK_20, TraySave.bCheckLowRemind[7]);
-		CheckDlgButton(hDlg, IDC_CHECK_21, TraySave.bCheckLowRemind[8]);
-		CheckDlgButton(hDlg, IDC_CHECK_22, TraySave.bCheckLowRemind[9]);
-		CheckDlgButton(hDlg, IDC_CHECK_23, TraySave.bCheckLowRemind[10]);
-		CheckDlgButton(hDlg, IDC_CHECK_24, TraySave.bCheckLowRemind[11]);
-		WCHAR sz[64];
-		FloatToStr(TraySave.HighRemind[0], sz);
-		SetDlgItemText(hDlg, IDC_EDIT1, sz);
-		FloatToStr(TraySave.HighRemind[1], sz);
-		SetDlgItemText(hDlg, IDC_EDIT2, sz);
-		FloatToStr(TraySave.HighRemind[2], sz);
-		SetDlgItemText(hDlg, IDC_EDIT3, sz);
-		FloatToStr(TraySave.HighRemind[3], sz);
-		SetDlgItemText(hDlg, IDC_EDIT4, sz);
-		FloatToStr(TraySave.HighRemind[4], sz);
-		SetDlgItemText(hDlg, IDC_EDIT5, sz);
-		FloatToStr(TraySave.HighRemind[5], sz);
-		SetDlgItemText(hDlg, IDC_EDIT6, sz);
-		FloatToStr(TraySave.LowRemind[0],sz);		
-		SetDlgItemText(hDlg, IDC_EDIT7, sz);
-		FloatToStr(TraySave.LowRemind[1], sz);
-		SetDlgItemText(hDlg, IDC_EDIT8, sz);
-		FloatToStr(TraySave.LowRemind[2], sz);
-		SetDlgItemText(hDlg, IDC_EDIT9, sz);
-		FloatToStr(TraySave.LowRemind[3], sz);
-		SetDlgItemText(hDlg, IDC_EDIT10, sz);
-		FloatToStr(TraySave.LowRemind[4], sz);
-		SetDlgItemText(hDlg, IDC_EDIT11, sz);
-		FloatToStr(TraySave.LowRemind[5], sz);
-		SetDlgItemText(hDlg, IDC_EDIT12, sz);
-		FloatToStr(TraySave.HighRemind[6], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_13, sz);
-		FloatToStr(TraySave.HighRemind[7], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_14, sz);
-		FloatToStr(TraySave.HighRemind[8], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_15, sz);
-		FloatToStr(TraySave.HighRemind[9], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_16, sz);
-		FloatToStr(TraySave.HighRemind[10], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_17, sz);
-		FloatToStr(TraySave.HighRemind[11], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_18, sz);
-		FloatToStr(TraySave.LowRemind[6], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_19, sz);
-		FloatToStr(TraySave.LowRemind[7], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_20, sz);
-		FloatToStr(TraySave.LowRemind[8], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_21, sz);
-		FloatToStr(TraySave.LowRemind[9], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_22, sz);
-		FloatToStr(TraySave.LowRemind[10], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_23, sz);
-		FloatToStr(TraySave.LowRemind[11], sz);
-		SetDlgItemText(hDlg, IDC_EDIT_24, sz);
-		SetDlgItemText(hDlg, IDC_EDIT18, TraySave.szPriceName1);
-		SetDlgItemText(hDlg, IDC_EDIT19, TraySave.szPriceName2);
-		SetDlgItemText(hDlg, IDC_EDIT37, TraySave.szPriceName3);
-		SetDlgItemText(hDlg, IDC_EDIT38, TraySave.szPriceName4);
-		SetDlgItemText(hDlg, IDC_EDIT_OKX_WEB, TraySave.szOKXWeb);
-	}
-		break;
-	case WM_DESTROY:
-		TraySave.bCheckHighRemind[0] = IsDlgButtonChecked(hDlg, IDC_CHECK1);
-		TraySave.bCheckHighRemind[1] = IsDlgButtonChecked(hDlg, IDC_CHECK2);
-		TraySave.bCheckHighRemind[2] = IsDlgButtonChecked(hDlg, IDC_CHECK3);
-		TraySave.bCheckHighRemind[3] = IsDlgButtonChecked(hDlg, IDC_CHECK4);
-		TraySave.bCheckHighRemind[4] = IsDlgButtonChecked(hDlg, IDC_CHECK5);
-		TraySave.bCheckHighRemind[5] = IsDlgButtonChecked(hDlg, IDC_CHECK6);
-		TraySave.bCheckHighRemind[6] = IsDlgButtonChecked(hDlg, IDC_CHECK_13);
-		TraySave.bCheckHighRemind[7] = IsDlgButtonChecked(hDlg, IDC_CHECK_14);
-		TraySave.bCheckHighRemind[8] = IsDlgButtonChecked(hDlg, IDC_CHECK_15);
-		TraySave.bCheckHighRemind[9] = IsDlgButtonChecked(hDlg, IDC_CHECK_16);
-		TraySave.bCheckHighRemind[10] = IsDlgButtonChecked(hDlg, IDC_CHECK_17);
-		TraySave.bCheckHighRemind[11] = IsDlgButtonChecked(hDlg, IDC_CHECK_18);
-		TraySave.bCheckLowRemind[0] = IsDlgButtonChecked(hDlg, IDC_CHECK7);
-		TraySave.bCheckLowRemind[1] = IsDlgButtonChecked(hDlg, IDC_CHECK8);
-		TraySave.bCheckLowRemind[2] = IsDlgButtonChecked(hDlg, IDC_CHECK9);
-		TraySave.bCheckLowRemind[3] = IsDlgButtonChecked(hDlg, IDC_CHECK10);
-		TraySave.bCheckLowRemind[4] = IsDlgButtonChecked(hDlg, IDC_CHECK11);
-		TraySave.bCheckLowRemind[5] = IsDlgButtonChecked(hDlg, IDC_CHECK12);
-		TraySave.bCheckLowRemind[6] = IsDlgButtonChecked(hDlg, IDC_CHECK_19);
-		TraySave.bCheckLowRemind[7] = IsDlgButtonChecked(hDlg, IDC_CHECK_20);
-		TraySave.bCheckLowRemind[8] = IsDlgButtonChecked(hDlg, IDC_CHECK_21);
-		TraySave.bCheckLowRemind[9] = IsDlgButtonChecked(hDlg, IDC_CHECK_22);
-		TraySave.bCheckLowRemind[10] = IsDlgButtonChecked(hDlg, IDC_CHECK_23);
-		TraySave.bCheckLowRemind[11] = IsDlgButtonChecked(hDlg, IDC_CHECK_24);
-
-		WCHAR sz[64];
-		GetDlgItemText(hDlg, IDC_EDIT1, sz, 64);
-		TraySave.HighRemind[0] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT2, sz, 64);
-		TraySave.HighRemind[1] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT3, sz, 64);
-		TraySave.HighRemind[2] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT4, sz, 64);
-		TraySave.HighRemind[3] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT5, sz, 64);
-		TraySave.HighRemind[4] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT6, sz, 64);
-		TraySave.HighRemind[5] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT7, sz, 64);
-		TraySave.LowRemind[0] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT8, sz, 64);
-		TraySave.LowRemind[1] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT9, sz, 64);
-		TraySave.LowRemind[2] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT10, sz, 64);
-		TraySave.LowRemind[3] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT11, sz, 64);
-		TraySave.LowRemind[4] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT12, sz, 64);
-		TraySave.LowRemind[5] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_13, sz, 64);
-		TraySave.HighRemind[6] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_14, sz, 64);
-		TraySave.HighRemind[7] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_15, sz, 64);
-		TraySave.HighRemind[8] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_16, sz, 64);
-		TraySave.HighRemind[9] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_17, sz, 64);
-		TraySave.HighRemind[10] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_18, sz, 64);
-		TraySave.HighRemind[11] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_19, sz, 64);
-		TraySave.LowRemind[6] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_20, sz, 64);
-		TraySave.LowRemind[7] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_21, sz, 64);
-		TraySave.LowRemind[8] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_22, sz, 64);
-		TraySave.LowRemind[9] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_23, sz, 64);
-		TraySave.LowRemind[10] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT_24, sz, 64);
-		TraySave.LowRemind[11] = xwtof(sz);
-		GetDlgItemText(hDlg, IDC_EDIT18, TraySave.szPriceName1, 64);
-		GetDlgItemText(hDlg, IDC_EDIT19, TraySave.szPriceName2, 64);
-		GetDlgItemText(hDlg, IDC_EDIT37, TraySave.szPriceName3, 64);
-		GetDlgItemText(hDlg, IDC_EDIT38, TraySave.szPriceName4, 64);
-		GetDlgItemText(hDlg, IDC_EDIT_OKX_WEB, TraySave.szOKXWeb, 32);
-		if (GetOKXPrice(TraySave.szPriceName1, TraySave.szOKXWeb, &TrayData->fLastPrice1, &TrayData->fOpenPrice1, TrayData->szLastPrice1, NULL))
-			TraySave.iPriceInterface[0] = FALSE;
-		else if (GetSinaPrice(TraySave.szPriceName1, &TrayData->fLastPrice1, &TrayData->fOpenPrice1, TrayData->szLastPrice1, NULL))
-			TraySave.iPriceInterface[0] = TRUE;
-		if (GetOKXPrice(TraySave.szPriceName2, TraySave.szOKXWeb, &TrayData->fLastPrice2, &TrayData->fOpenPrice2, TrayData->szLastPrice2, NULL))
-			TraySave.iPriceInterface[1] = FALSE;
-		else if (GetSinaPrice(TraySave.szPriceName2, &TrayData->fLastPrice2, &TrayData->fOpenPrice2, TrayData->szLastPrice2, NULL))
-			TraySave.iPriceInterface[1] = TRUE;
-		if (GetOKXPrice(TraySave.szPriceName3, TraySave.szOKXWeb, &TrayData->fLastPrice3, &TrayData->fOpenPrice3, TrayData->szLastPrice3, NULL))
-			TraySave.iPriceInterface[2] = FALSE;
-		else if (GetSinaPrice(TraySave.szPriceName3, &TrayData->fLastPrice3, &TrayData->fOpenPrice3, TrayData->szLastPrice3, NULL))
-			TraySave.iPriceInterface[2] = TRUE;
-		if (GetOKXPrice(TraySave.szPriceName4, TraySave.szOKXWeb, &TrayData->fLastPrice4, &TrayData->fOpenPrice4, TrayData->szLastPrice4, NULL))
-			TraySave.iPriceInterface[3] = FALSE;
-		else if (GetSinaPrice(TraySave.szPriceName4, &TrayData->fLastPrice4, &TrayData->fOpenPrice4, TrayData->szLastPrice4, NULL))
-			TraySave.iPriceInterface[3] = TRUE;
-		WriteReg();
-		break;	
-	case WM_COMMAND:
-		if (LOWORD(wParam) == IDC_TWOFOUR)
-		{
-			RECT rc;
-			GetWindowRect(hDlg, &rc);
-			int x, y, w, h;
-			if (lParam != 888)
-			{
-				if (TraySave.bTwoFour)
-				{
-					rc.right = (rc.right - rc.left) / 2;
-				}
-				else
-				{
-					rc.right = (rc.right - rc.left) * 2;
-				}
-				rc.left = 0;
-				TraySave.bTwoFour = !TraySave.bTwoFour;
-				WriteReg();
-				SetWH();
-				AdjustWindowPos();
-			}
-			w = rc.right-rc.left;
-			h = rc.bottom - rc.top;
-			RECT wrc, src;
-			GetWindowRect(hTaskBar, &wrc);
-			GetScreenRect(hTaskBar, &src, TRUE);
-			if (wrc.bottom + h > src.bottom)
-				y = wrc.top - h;
-			else
-				y = wrc.bottom;
-			if (wrc.right - (wrc.right - wrc.left) / 2 + w / 2 > src.right)
-				x = src.right - w;
-			else if (wrc.right - (wrc.right - wrc.left) / 2 - w / 2 < src.left)
-				x = src.left;
-			else
-				x = wrc.right - (wrc.right - wrc.left) / 2 - w / 2;
-			SetWindowPos(hPrice, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-		}
-		break;
-	}
-	return(INT_PTR)FALSE;
 }
 void ShowSelectMenu(BOOL bNet)
 {
