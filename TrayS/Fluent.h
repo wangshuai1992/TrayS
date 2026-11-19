@@ -1211,7 +1211,7 @@ inline DWORD FRgb(COLORREF c) { return (GetRValue(c) << 16) | (GetGValue(c) << 8
 inline DWORD FSbT1() { return fSbDark ? 0xFFFFFF : 0x1A1A1A; }
 inline DWORD FSbT2() { return fSbDark ? 0xA8A8A8 : 0x6B6B6B; }
 inline float FMax(float a, float b) { return a > b ? a : b; }
-//三档颜色没改过时按方案 A：数字一律正文色，超阈值用底色块 + 图标；改过就照用户的颜色显示数字。g: 0 流量/硬盘读写 1 占用/温度
+//三档颜色是否改过默认值。g: 0 流量/硬盘读写 1 占用/温度
 BOOL FSbCustom(int g)
 {
 	const COLORREF def[2][3] = { { RGB(128, 128, 128), RGB(255, 255, 255), RGB(255, 0, 0) }, { RGB(0, 168, 0), RGB(255, 128, 0), RGB(255, 0, 0) } };
@@ -1219,6 +1219,14 @@ BOOL FSbCustom(int g)
 		if (TraySave.cMonitorColor[(g ? 4 : 1) + i] != def[g][i])
 			return TRUE;
 	return FALSE;
+}
+//设置里“数字按自定义颜色显示”：关时数字用正文色，开时用三档颜色；超阈值的底色块和警示图标都有。
+//没设过（旧配置）时，改过三档颜色的算打开，保持原来按颜色显示
+BOOL FNumColor()
+{
+	if (TraySave.iNumColor < 0)
+		TraySave.iNumColor = FSbCustom(0) || FSbCustom(1) ? 1 : 0;
+	return TraySave.iNumColor;
 }
 inline int FLevel(DWORD v, DWORD warn, DWORD crit) { return v > crit ? 2 : v > warn ? 1 : 0; }
 void FSbLabel(LPCWSTR src, WCHAR* dst)//设置里的标签去掉结尾的冒号
@@ -1245,9 +1253,8 @@ void FSbMetric(float x, float y, float w, float h, LPCWSTR label, LPCWSTR val, i
 	float sc = iDPI / 96.f;
 	if (TraySave.iMonitorSimple == 0 && label && label[0])
 		FSbText(label, x, y, w, h, fSbL, 400, FSbT2(), 0);
-	BOOL custom = FSbCustom(g);
-	DWORD tc = custom ? FRgb(TraySave.cMonitorColor[(g ? 4 : 1) + level]) : FSbT1();
-	if (!custom && level > 0)
+	DWORD tc = FNumColor() ? FRgb(TraySave.cMonitorColor[(g ? 4 : 1) + level]) : FSbT1();
+	if (level > 0)
 	{
 		float vw = FTextW(val, fSbV, 600, 2);
 		float gw = level == 2 ? fSbGlyphW + 3 * sc : 0;
@@ -1267,7 +1274,16 @@ void FSbRate(float x, float y, float w, float h, int kind, ULONG64 v, int level,
 	int mode = TraySave.iMonitorSimple;
 	WCHAR n[16], u[8], l[8];
 	FRateStr(v, bBit, n, u, minU);
-	if (kind <= 1)
+	float ux = x + w - fSbUnitW;
+	if (level > 0)//超阈值：数字和单位垫底色块，同指标格
+	{
+		float vw = FTextW(n, fSbV, 600, 2), uw = FTextW(u, fSbU, 400, 2), ph = fSbV * 1.4f;
+		float px = ux - 3 * sc - vw - 4 * sc;
+		FFill(px, y + (h - ph) / 2, ux + uw + 4 * sc - px, ph, level == 2 ? F_CRIT : F_WARN, level == 2 ? (fSbDark ? .32f : .20f) : (fSbDark ? .30f : .32f), 4 * sc);
+	}
+	if (level == 2 && mode < 2)//警告：左边的箭头 / 标签换成警示图标（不只靠颜色，也不用加宽）
+		FSbText(L"\xE7BA", x, y, fSbGlyphW, h, fSbV * .85f, 400, fSbDark ? 0xFF6B6B : 0xC42B1C, 0, 3);
+	else if (kind <= 1)
 	{
 		if (mode < 2)
 			FSbText(kind == 0 ? L"\xE74A" : L"\xE74B", x, y, fSbArrowW, h, fSbV * .8f, 400,
@@ -1281,8 +1297,7 @@ void FSbRate(float x, float y, float w, float h, int kind, ULONG64 v, int level,
 			lstrcpy(l, kind == 2 ? L"R" : L"W");
 		FSbText(l, x, y, w, h, fSbL, 400, FSbT2(), 0);
 	}
-	DWORD tc = FSbCustom(0) ? FRgb(TraySave.cMonitorColor[1 + level]) : FSbT1();
-	float ux = x + w - fSbUnitW;
+	DWORD tc = FNumColor() ? FRgb(TraySave.cMonitorColor[1 + level]) : FSbT1();
 	FSbText(u, ux, y, fSbUnitW, h, fSbU, 400, FSbT2(), 0);
 	FSbText(n, x, y, ux - x - 3 * sc, h, fSbV, 600, tc, 2);
 }

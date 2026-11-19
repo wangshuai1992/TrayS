@@ -6,6 +6,7 @@
 
 enum { FR_HEAD = 1, FR_TOGGLE, FR_SEG, FR_SEG3, FR_BTN, FR_SWATCH, FR_SLIDER, FR_EDIT, FR_GRID2, FR_EDIT5, FR_NOTE, FR_LINK, FR_ABOUT };
 struct FROW { BYTE page; BYTE kind; LPCWSTR icon; LPCWSTR title; LPCWSTR desc; int id[5]; };
+#define IDC_FS_NUMCOLOR 1950//“数字按自定义颜色显示”开关，对话框模板里没有，FSetInit 里创建
 #define FSET_PAGES 9
 const WCHAR* fSetPageName[FSET_PAGES] = { L"状态条", L"位置", L"悬停窗口", L"任务栏外观", L"预警与提醒", L"网络与硬盘", L"文字与字体", L"常规", L"关于" };
 const WCHAR fSetPageIcon[FSET_PAGES] = { 0xE9D2, 0xE718, 0xE7C4, 0xE790, 0xEA8F, 0xE968, 0xE8D2, 0xE713, 0xE946 };
@@ -59,7 +60,8 @@ const FROW fSetRows[] = {
 	{ 4, FR_TOGGLE, 0, L"超过下面的值时响铃", L"填 0 表示这一项不响铃；网速和硬盘的单位是 MB/s", { IDC_CHECK_SOUND } },
 	{ 4, FR_EDIT5, 0, NULL, NULL, { IDC_EDIT9, IDC_EDIT10, IDC_EDIT11, IDC_EDIT12, IDC_EDIT26 } },
 	{ 4, FR_HEAD, 0, L"数字颜色" },
-	{ 4, FR_SWATCH, 0, L"网速和硬盘", L"正常 / 预警 / 警告；保持默认时按新样式显示", { IDC_BUTTON_COLOR_TRAFFIC_LOW, IDC_BUTTON_COLOR_TRAFFIC_MEDIUM, IDC_BUTTON_COLOR_TRAFFIC_HIGH } },
+	{ 4, FR_TOGGLE, 0, L"数字按自定义颜色显示", L"关闭时数字用白色，浅色任务栏上用黑色", { IDC_FS_NUMCOLOR } },
+	{ 4, FR_SWATCH, 0, L"网速和硬盘", NULL, { IDC_BUTTON_COLOR_TRAFFIC_LOW, IDC_BUTTON_COLOR_TRAFFIC_MEDIUM, IDC_BUTTON_COLOR_TRAFFIC_HIGH } },
 	{ 4, FR_SWATCH, 0, L"占用和温度", NULL, { IDC_BUTTON_COLOR_LOW, IDC_BUTTON_COLOR_MEDUIM, IDC_BUTTON_COLOR_HIGH } },
 
 	{ 5, FR_BTN, L"\xE839", L"网卡", L"状态条和悬停窗口显示哪块网卡的速度", { IDC_BUTTON_SELECT_NET } },
@@ -163,7 +165,7 @@ float FSetSegW(int id)
 }
 //排版当前页：放控件、记下要画的卡片和文字
 #define FSET_W 860.f
-#define FSET_H 670.f
+#define FSET_H 700.f
 #define FSET_NAV 268.f
 void FSetLayout()
 {
@@ -610,10 +612,11 @@ void FSetDrawSwatch(HWND c, HDC hdc)
 	GetWindowText(c, t, 16);
 	BOOL bAuto = id == IDC_BUTTON_COLOR_BACKGROUND && (cr == RGB(0, 0, 1) || cr == 0);
 	DWORD rgb = bAuto ? FSTrack() : FRgb(cr);
-	FFill(0, 0, w, h, rgb, 1, FS(4));
+	float a = IsWindowEnabled(c) ? 1.f : .3f;//数字颜色开关关着时变淡
+	FFill(0, 0, w, h, rgb, a, FS(4));
 	FStroke(0, 0, w, h, fs.dark ? 0xFFFFFF : 0x000000, .16f, FS(4));
 	BOOL light = GetRValue(cr) * 299 + GetGValue(cr) * 587 + GetBValue(cr) * 114 > 150000;
-	FText(bAuto ? L"自动" : t, 0, 0, w, h, FS(12), 600, bAuto ? FST2() : light ? 0x1A1A1A : 0xFFFFFF, 1, 1);
+	FText(bAuto ? L"自动" : t, 0, 0, w, h, FS(12), 600, bAuto || a < 1 ? FST2() : light ? 0x1A1A1A : 0xFFFFFF, a < 1 ? .6f : 1, 1);
 	FSetEnd();
 }
 //滑块：细轨道，已选部分强调色，圆形滑块
@@ -680,6 +683,15 @@ void FSetTheme()
 		FreeLibrary(hd);
 }
 //打开设置窗口时调用（原来的初始化做完之后）
+void FSetNumColorSync()//数字颜色开关关着时，网速/占用的六个色块变灰、不能点
+{
+	for (int id = IDC_BUTTON_COLOR_TRAFFIC_LOW; id <= IDC_BUTTON_COLOR_HIGH; id++)
+	{
+		HWND c = GetDlgItem(fs.h, id);
+		EnableWindow(c, TraySave.iNumColor);
+		InvalidateRect(c, NULL, FALSE);
+	}
+}
 void FSetInit(HWND h)
 {
 	if (!FluentInit())
@@ -717,6 +729,9 @@ void FSetInit(HWND h)
 	};
 	for (int i = 0; i < (int)(sizeof(cap) / sizeof(cap[0])); i++)
 		SetDlgItemText(h, cap[i].id, cap[i].t);
+	CreateWindowEx(0, L"Button", L"", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, h, (HMENU)IDC_FS_NUMCOLOR, GetModuleHandle(NULL), NULL);
+	CheckDlgButton(h, IDC_FS_NUMCOLOR, FNumColor());
+	FSetNumColorSync();
 	for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
 	{
 		SendMessage(c, WM_SETFONT, (WPARAM)fs.font, FALSE);
@@ -795,6 +810,14 @@ BOOL FSetProc(HWND h, UINT msg, WPARAM wParam, LPARAM lParam, INT_PTR* ret)
 		return TRUE;
 	}
 	case WM_COMMAND:
+		if (LOWORD(wParam) == IDC_FS_NUMCOLOR && HIWORD(wParam) == BN_CLICKED)//状态条下次刷新时换颜色
+		{
+			TraySave.iNumColor = IsDlgButtonChecked(h, IDC_FS_NUMCOLOR) == BST_CHECKED;
+			FSetNumColorSync();
+			WriteReg();
+			*ret = TRUE;
+			return TRUE;
+		}
 		if (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == EN_KILLFOCUS)//输入框底边强调色
 		{
 			for (int i = 0; i < fs.npi; i++)

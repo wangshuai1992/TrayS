@@ -246,6 +246,7 @@ typedef struct _TRAYSAVE//默认参数
 	BOOL bTwoFour;
 	COLORREF cPriceColor[4];//行情颜色
 	BOOL bTrayStyle;//任务栏风格开关
+	int iNumColor;//数字按自定义颜色显示：1 开 0 关，-1 没设过（旧配置文件短，读不到这里）
 }TRAYSAVE;
 TRAYSAVE TraySave = {
 	116,
@@ -310,7 +311,8 @@ TRAYSAVE TraySave = {
 	L"www.okx.com",
 	FALSE,
 	{RGB(0, 168, 0), RGB(255, 0, 0),RGB(0,255,128),RGB(255,128,0)},
-	TRUE
+	TRUE,
+	-1
 };
 int wTraffic;//流量宽度
 int wTemperature;//温度宽度
