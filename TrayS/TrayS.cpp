@@ -2067,6 +2067,11 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				}
 			}
 		*/
+		if (!bFullScreen && GetAncestor(hTaskBar, GA_PARENT) != hTray)//没挂到任务栏上（实测关机过程中被重启时 SetParent 会失败），状态条会变成独立窗口跑到屏幕顶上。原来只在创建时挂一次，要重启进程才能恢复
+		{
+			SetParent(hTaskBar, hTray);
+			otleft = -1;
+		}
 		RECT trayrc;
 		GetWindowRect(hTray, &trayrc);
 		if (trayrc.right - trayrc.left > trayrc.bottom - trayrc.top)
@@ -2075,7 +2080,7 @@ void AdjustWindowPos()//设置信息窗口位置大小
 			VTray = TRUE;
 		if (VTray == FALSE)
 		{
-			int nleft;
+			int nleft = MININT;//开机头几秒任务栏子窗口还没建好，取不到位置时这一轮不移动。原来会拿未初始化的值把状态条移到乱七八糟的地方
 			if (hWin11UI)
 			{
 				RECT startrc, tasklistrc;
@@ -2103,8 +2108,8 @@ void AdjustWindowPos()//设置信息窗口位置大小
 							if (!bLeft)
 							{
 								RECT tnrc;
-								GetWindowRect(hTrayNotifyWnd, &tnrc);
-								nleft = tnrc.left - mWidth;
+								if (GetWindowRect(hTrayNotifyWnd, &tnrc))
+									nleft = tnrc.left - mWidth;
 							}
 							else
 							{
@@ -2119,22 +2124,28 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				if (TraySave.bNear)
 				{
 					RECT tasklistrc;
-					GetWindowRect(hTaskListWnd, &tasklistrc);
-					if (TraySave.bMonitorLeft)
-						nleft = tasklistrc.left - mWidth;
-					else
-						nleft = tasklistrc.left + iIconsWidth + 2;
+					if (GetWindowRect(hTaskListWnd, &tasklistrc))
+					{
+						if (TraySave.bMonitorLeft)
+							nleft = tasklistrc.left - mWidth;
+						else
+							nleft = tasklistrc.left + iIconsWidth + 2;
+					}
 				}
 				else
 				{
 					RECT taskrc;
-					GetWindowRect(hTaskWnd, &taskrc);
-					if (TraySave.bMonitorLeft)
-						nleft = taskrc.left + 2;
-					else
-						nleft = taskrc.right - mWidth;
+					if (GetWindowRect(hTaskWnd, &taskrc))
+					{
+						if (TraySave.bMonitorLeft)
+							nleft = taskrc.left + 2;
+						else
+							nleft = taskrc.right - mWidth;
+					}
 				}
 			}
+			if (nleft == MININT)
+				return;
 			int h = wHeight * 2;
 			int ntop;
 			if (trayrc.bottom - trayrc.top < h)
