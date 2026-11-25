@@ -2092,6 +2092,13 @@ void AdjustWindowPos()//设置信息窗口位置大小
 			SetParent(hTaskBar, hTray);
 			otleft = -1;
 		}
+		if (!bFullScreen && hWin11UI)//Win11 任务栏内容层（XAML）比状态条后建时 Z 序在它上面，状态条被整个盖住看不见（悬停照样出浮窗）。开机时 TrayS 抢在资源管理器建好任务栏之前挂上去就会这样
+		{
+			HWND h = hTaskBar;
+			while ((h = GetWindow(h, GW_HWNDPREV)) && h != hWin11UI);
+			if (h)
+				SetWindowPos(hTaskBar, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		}
 		RECT trayrc;
 		GetWindowRect(hTray, &trayrc);
 		if (trayrc.right - trayrc.left > trayrc.bottom - trayrc.top)
